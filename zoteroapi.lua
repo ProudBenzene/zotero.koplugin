@@ -12,7 +12,9 @@ local util = require("util")
 local API = {}
 local API_ROOT = "https://api.zotero.org"
 local CACHE_FORMAT = 1
+local MAX_SYNC_ATTEMPTS = 3
 local LIBRARY_CHANGED = "The Zotero library changed during synchronization. Please retry."
+local NOT_MODIFIED = "not_modified"
 local SUPPORTED_MEDIA_TYPES = { ["application/pdf"] = true, ["application/epub+zip"] = true }
 
 local function trim(value)
@@ -151,6 +153,9 @@ function API.init(zotero_dir)
     API.settings = LuaSettings:open(BaseUtil.joinPath(zotero_dir, "meta.lua"))
     API.cache_path = BaseUtil.joinPath(zotero_dir, "library.json")
     API.state = nil
+    API.backoff_until = 0
+    API.backoff_attempts = 0
+    API.sync_in_progress = false
     ok, err = update_storage_dir()
     if not ok then error("Could not create attachment storage: " .. tostring(err)) end
 end
@@ -234,7 +239,19 @@ function API.getHeaders(api_key)
     return { ["Zotero-API-Key"] = api_key, ["Zotero-API-Version"] = "3" }
 end
 
+local function backoff_error()
+    local remaining = (API.backoff_until or 0) - os.time()
+    if remaining > 0 then
+        return ("Zotero requested a delay. Please retry in %d seconds."):format(remaining)
+    end
+end
+
 local function request(req, is_file)
+    local is_api = origin(req.url) == origin(API_ROOT)
+    if is_api and not API.sync_in_progress then
+        local err = backoff_error()
+        if err then return nil, err, {} end
+    end
     local previous_block, previous_total = socketutil.block_timeout, socketutil.total_timeout
     local total_timeout = is_file and socketutil.FILE_TOTAL_TIMEOUT or socketutil.LARGE_TOTAL_TIMEOUT
     socketutil:set_timeout(is_file and socketutil.FILE_BLOCK_TIMEOUT or socketutil.LARGE_BLOCK_TIMEOUT, total_timeout)
@@ -249,20 +266,36 @@ local function request(req, is_file)
     socketutil:set_timeout(previous_block, previous_total)
     if type(headers) ~= "table" then headers = {} end
     if not ok then return nil, "Network request failed: " .. tostring(result), {} end
+    if is_api then
+        local delay = tonumber(header(headers, "backoff")) or 0
+        if code == 429 or code == 503 then
+            local retry_after = tonumber(header(headers, "retry-after"))
+            if code == 429 then
+                API.backoff_attempts = (API.backoff_attempts or 0) + 1
+                retry_after = retry_after or math.min(60 * 2 ^ (API.backoff_attempts - 1), 3600)
+            end
+            delay = math.max(delay, retry_after or 0)
+        elseif code == 200 then
+            API.backoff_attempts = 0
+        end
+        if delay > 0 then API.backoff_until = math.max(API.backoff_until or 0, os.time() + math.ceil(delay)) end
+    end
     return result, code, headers
 end
 
 function API.verifyResponse(result, code)
     if result ~= 1 then return "Error: " .. tostring(code or "request failed") end
+    if code == 429 then return backoff_error() or "Zotero rate limit reached. Please retry later." end
     if code ~= 200 then return "Error: API responded with status code " .. tostring(code) end
 end
 
-local function fetch_json(url, headers)
+local function fetch_json(url, headers, allow_not_modified)
     local response = {}
     local result, code, response_headers = request{
         method = "GET", url = url, headers = headers, redirect = false,
         sink = ltn12.sink.table(response),
     }
+    if result == 1 and code == 304 and allow_not_modified then return nil, NOT_MODIFIED, response_headers end
     local err = API.verifyResponse(result, code)
     if err then return nil, err end
     local ok, data = pcall(JSON.decode, table.concat(response))
@@ -290,15 +323,16 @@ end
 -- All pages must belong to the same library version. Callbacks should stage changes.
 -- Without a callback, the third return value is the library version.
 function API.fetchCollectionPaginated(collection_url, headers, callback, expected_version)
-    local total, err = API.fetchCollectionSize(collection_url, headers)
-    if err then return nil, err end
     local separator = collection_url:find("?", 1, true) and "&" or "?"
-    local items, version = {}, expected_version
-    -- Even an empty library needs one GET to obtain its version.
-    for start = 0, math.max(total - 1, 0), 100 do
-        local page_url = collection_url .. separator .. "limit=100&start=" .. start
-        local data, response_headers
-        data, err, response_headers = fetch_json(page_url, headers)
+    local page_url = collection_url .. separator .. "limit=100"
+    local items, visited, version = {}, {}, expected_version
+    while page_url do
+        if origin(page_url) ~= origin(API_ROOT) or visited[page_url] then
+            return nil, "Error: invalid pagination link"
+        end
+        visited[page_url] = true
+        local conditional = header(headers, "if-modified-since-version") ~= nil and not version
+        local data, err, response_headers = fetch_json(page_url, headers, conditional)
         if err then return nil, err end
         local page_version
         page_version, err = response_version(response_headers)
@@ -317,47 +351,96 @@ function API.fetchCollectionPaginated(collection_url, headers, callback, expecte
             if not callback then items[#items + 1] = item end
         end
         if callback then callback(data) end
+        page_url = nil
+        for link, relation in (header(response_headers, "link") or ""):gmatch('<([^>]+)>;%s*rel="([^"]+)"') do
+            if relation == "next" then page_url = URL.absolute(collection_url, link) end
+        end
     end
     if callback then return version end
     return items, nil, version
+end
+
+local function verify_key(api_key, user_id)
+    local key, err = fetch_json(API_ROOT .. "/keys/current", API.getHeaders(api_key))
+    if err then return err end
+    if tostring(key.userID) ~= user_id then return "Error: the API key does not belong to this User ID" end
+    if type(key.access) ~= "table" or type(key.access.user) ~= "table" or not key.access.user.library then
+        return "Error: the API key does not permit reading your library"
+    end
 end
 
 local function sync_library(api_key, user_id)
     local state = get_state()
     local since = API.getLibraryVersion()
     local headers = API.getHeaders(api_key)
+    local item_headers = copy_table(headers)
+    if since > 0 then item_headers["If-Modified-Since-Version"] = tostring(since) end
     local prefix = API_ROOT .. "/users/" .. user_id
-    local items = since == 0 and {} or copy_table(state.items)
-    local collections = since == 0 and {} or copy_table(state.collections)
-    local function merge(target)
-        return function(entries)
-            for _, item in ipairs(entries) do
-                if item.data.deleted == true or item.data.deleted == 1 then target[item.key] = nil
-                else target[item.key] = item end
+    for attempt = 1, MAX_SYNC_ATTEMPTS do
+        local items = since == 0 and {} or copy_table(state.items)
+        local collections = since == 0 and {} or copy_table(state.collections)
+        local function merge(target)
+            return function(entries)
+                for _, item in ipairs(entries) do
+                    if item.data.deleted == true or item.data.deleted == 1 then target[item.key] = nil
+                    else target[item.key] = item end
+                end
             end
         end
+        local version, err = API.fetchCollectionPaginated(prefix .. "/items?since=" .. since .. "&includeTrashed=1", item_headers, merge(items))
+        if err == NOT_MODIFIED and since > 0 then return nil end
+        if not err and version < since then return "The library version went backwards. Please resync the entire collection." end
+        if not err then
+            local collection_version
+            collection_version, err = API.fetchCollectionPaginated(prefix .. "/collections?since=" .. since, headers, merge(collections), version)
+            if not err and collection_version ~= version then err = LIBRARY_CHANGED end
+        end
+        -- A full refresh starts empty; there are no old objects whose deletion log is needed.
+        if not err and since ~= 0 then
+            local deleted, deleted_headers
+            deleted, err, deleted_headers = fetch_json(prefix .. "/deleted?since=" .. since, headers)
+            if not err then
+                local deleted_version
+                deleted_version, err = response_version(deleted_headers)
+                if not err and deleted_version ~= version then err = LIBRARY_CHANGED end
+                if not err then
+                    if type(deleted.items) ~= "table" or type(deleted.collections) ~= "table" then
+                        err = "Error: invalid deletion log in Zotero response"
+                    else
+                        for _, key in ipairs(deleted.items) do items[key] = nil end
+                        for _, key in ipairs(deleted.collections) do collections[key] = nil end
+                    end
+                end
+            end
+        end
+        if not err then
+            local snapshot = empty_state()
+            snapshot.items, snapshot.collections, snapshot.version = items, collections, version
+            local ok
+            ok, err = save_state(snapshot)
+            if not ok then return err end
+            API.settings:saveSetting("force_full_sync", false)
+            API.saveSettings()
+            return nil
+        end
+        if err ~= LIBRARY_CHANGED or attempt == MAX_SYNC_ATTEMPTS then return err end
+        -- Honor an overload response instead of immediately restarting a busy server.
+        local delay_error = backoff_error()
+        if delay_error then return delay_error end
+        BaseUtil.usleep(100000 * 2 ^ (attempt - 1))
     end
-    local version, err = API.fetchCollectionPaginated(prefix .. "/items?since=" .. since .. "&includeTrashed=true", headers, merge(items))
-    if err then return err end
-    if version < since then return "The library version went backwards. Please resync the entire collection." end
-    local collection_version
-    collection_version, err = API.fetchCollectionPaginated(prefix .. "/collections?since=" .. since .. "&includeTrashed=true", headers, merge(collections), version)
-    if err then return err end
-    if collection_version ~= version then return LIBRARY_CHANGED end
-    local snapshot = empty_state()
-    snapshot.items, snapshot.collections, snapshot.version = items, collections, version
-    local ok
-    ok, err = save_state(snapshot)
-    if not ok then return err end
-    API.settings:saveSetting("force_full_sync", false)
-    API.saveSettings()
-    return nil
 end
 
 function API.syncAllItems()
     local err, api_key, user_id = API.ensureKeyAndID()
     if err then return err end
+    err = backoff_error()
+    if err then return err end
+    err = verify_key(api_key, user_id)
+    if err then return err end
+    API.sync_in_progress = true
     local ok, result = pcall(sync_library, api_key, user_id)
+    API.sync_in_progress = false
     if not ok then return "Could not synchronize Zotero: " .. tostring(result) end
     return result
 end
@@ -370,7 +453,12 @@ function API.checkWebDAV()
     local url = trim(API.getWebDAVUrl())
     if not origin(url) then return "A valid HTTP or HTTPS WebDAV URL is required" end
     local headers = API.getWebDAVHeaders()
-    local result, code = request{url = url, method = "PROPFIND", headers = headers, redirect = false, sink = ltn12.sink.table({})}
+    headers.Depth = "0"
+    local body = '<?xml version="1.0"?><propfind xmlns="DAV:"><prop><getcontentlength/></prop></propfind>'
+    headers["Content-Type"] = "application/xml; charset=utf-8"
+    headers["Content-Length"] = tostring(#body)
+    local result, code = request{url = url, method = "PROPFIND", headers = headers, redirect = false,
+        source = ltn12.source.string(body), sink = ltn12.sink.table({})}
     if result ~= 1 then return "Connection failed: " .. tostring(code) end
     if code == 200 or code == 207 then return nil end
     if code == 401 or code == 403 then return "Access forbidden. Check username and password." end
@@ -401,6 +489,7 @@ end
 
 -- Explicit redirects prevent API keys and WebDAV passwords reaching a storage host.
 local function download_file(url, headers, path)
+    local file_headers = {}
     for redirect = 0, 5 do
         if not origin(url) then return nil, "Invalid download URL" end
         local f, err = io.open(path, "wb")
@@ -412,6 +501,12 @@ local function download_file(url, headers, path)
                 return 1
             end,
         }, true)
+        if origin(url) == origin(API_ROOT) then
+            for _, name in ipairs({ "zotero-file-md5", "zotero-file-compressed", "zotero-file-modification-time" }) do
+                local value = header(response_headers, name)
+                if value then file_headers[name] = value end
+            end
+        end
         local closed, close_err = f:close()
         if not closed then os.remove(path); return nil, "Could not save download: " .. tostring(close_err) end
         if result == 1 and (code == 301 or code == 302 or code == 303 or code == 307 or code == 308) then
@@ -425,6 +520,7 @@ local function download_file(url, headers, path)
         else
             err = API.verifyResponse(result, code)
             if err then os.remove(path); return nil, err end
+            for name, value in pairs(file_headers) do response_headers[name] = value end
             return true, nil, response_headers
         end
     end
@@ -442,7 +538,8 @@ end
 
 local function extract_archive(zip_path, filename, target_path)
     local temporary = target_path .. ".part"
-    local names = { filename }
+    -- Current Zotero ZIPs use plain paths; old ZIPs use base64(UTF-8 path) + %ZB64.
+    local names = { filename, sha2.bin_to_base64(filename) .. "%ZB64" }
     local extracted = false
     for _, name in ipairs(names) do
         local pattern = name:gsub("([%[%]%*%?\\])", "\\%1")
@@ -493,7 +590,7 @@ local function download_attachment(key, download_callback)
     if not attachment or not attachment.data then return nil, "The attachment was not found in the library" end
     if attachment.data.itemType ~= "attachment" then return nil, "This item is not an attachment" end
     local mode = attachment.data.linkMode
-    if mode ~= "imported_file" then
+    if mode ~= "imported_file" and mode ~= "imported_url" then
         return nil, "Unsupported attachment link mode: " .. tostring(mode) .. ". Linked files and linked URLs are not stored by Zotero."
     end
     if not SUPPORTED_MEDIA_TYPES[attachment.data.contentType] then return nil, "Only PDF and EPUB attachments are supported" end
@@ -522,7 +619,28 @@ local function download_attachment(key, download_callback)
         ok, err, response_headers = download_file(API_ROOT .. "/users/" .. user_id .. "/items/" .. key .. "/file", API.getHeaders(api_key), temporary)
     end
     if not ok then os.remove(temporary); return nil, err end
-    if md5 and file_md5(temporary) ~= md5 then
+    local compressed = (header(response_headers, "zotero-file-compressed") or ""):lower() == "yes"
+    local etag = header(response_headers, "etag")
+    if etag then etag = etag:gsub('^"', ""):gsub('"$', ""):lower() end
+    local remote_md5 = header(response_headers, "zotero-file-md5")
+    if remote_md5 then remote_md5 = remote_md5:lower() end
+    if compressed then
+        -- The storage hash/ETag describes the ZIP, while data.md5 describes its main file.
+        local zip_md5 = file_md5(temporary)
+        if (remote_md5 and remote_md5 ~= zip_md5) or (etag and etag ~= zip_md5) then
+            os.remove(temporary)
+            return nil, "The downloaded ZIP does not match Zotero's storage checksum."
+        end
+        local unpacked = temporary .. ".unpacked"
+        local path
+        path, err = extract_archive(temporary, attachment.data.filename, unpacked)
+        os.remove(temporary)
+        if not path then return nil, err end
+        ok, err = os.rename(unpacked, temporary)
+        if not ok then os.remove(unpacked); return nil, "Could not save unpacked attachment: " .. tostring(err) end
+    end
+    if md5 and ((not compressed and remote_md5 and remote_md5 ~= md5)
+        or (not compressed and etag and etag ~= md5) or file_md5(temporary) ~= md5) then
         os.remove(temporary)
         return nil, "The downloaded file does not match Zotero's attachment metadata. Synchronize the library and retry."
     end
@@ -530,6 +648,8 @@ local function download_attachment(key, download_callback)
     if not attributes or attributes.size == 0 then os.remove(temporary); return nil, "The downloaded attachment is empty" end
     ok, err = os.rename(temporary, target_path)
     if not ok then os.remove(temporary); return nil, "Could not save attachment: " .. tostring(err) end
+    local mtime = tonumber(attachment.data.mtime)
+    if mtime then lfs.touch(target_path, os.time(), mtime / 1000) end
     ok, err = write_json(metadata_path, { version = attachment.version, md5 = md5 })
     if not ok then return nil, "Could not save attachment metadata: " .. tostring(err) end
     return target_path

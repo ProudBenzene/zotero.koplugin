@@ -38,6 +38,41 @@ describe("Zotero API offline regressions", function()
         assert(API.ensureKeyAndID())
     end)
 
+    it("checks key ownership and library access before synchronizing", function()
+        support.response=function(req) return support.respond(req,{userID=456,access={user={library=true}}}) end
+        assert(API.syncAllItems():find("does not belong",1,true))
+        assert(#support.requests==1)
+        support.response=function(req) return support.respond(req,{userID=123,access={user={library=false}}}) end
+        assert(API.syncAllItems():find("does not permit",1,true))
+        support.response=function(req) return support.respond(req,{userID=123,access={user=true}}) end
+        assert(API.syncAllItems():find("does not permit",1,true))
+    end)
+
+    it("follows pagination links without a HEAD or an extra empty page", function()
+        local a=support.attachment("ATTACH01","a.pdf")
+        local b=support.attachment("ATTACH02","b.pdf")
+        support.response=function(req,index)
+            assert(req.method=="GET")
+            if index==1 then
+                assert(req.url=="https://api.zotero.org/users/123/items?limit=100")
+                return support.respond(req,{a},12,{link='<https://api.zotero.org/users/123/items?limit=100&start=100>; rel="next"'})
+            end
+            assert(req.url:find("start=100",1,true))
+            return support.respond(req,{b},12)
+        end
+        local items,err,version=API.fetchCollectionPaginated("https://api.zotero.org/users/123/items",API.getHeaders("FAKE-KEY"))
+        assert(not err and #items==2 and version==12 and #support.requests==2)
+    end)
+
+    it("rejects cross-origin pagination links and cycles", function()
+        support.response=function(req) return support.respond(req,{},12,{link='<https://evil.invalid/items>; rel="next"'}) end
+        local result,err=API.fetchCollectionPaginated("https://api.zotero.org/users/123/items",{})
+        assert(not result and err:find("invalid pagination",1,true) and #support.requests==1)
+        support.response=function(req) return support.respond(req,{},12,{link='<https://api.zotero.org/users/123/items?limit=100>; rel="next"'}) end
+        result,err=API.fetchCollectionPaginated("https://api.zotero.org/users/123/items",{})
+        assert(not result and err:find("invalid pagination",1,true))
+    end)
+
     it("returns errors for network failures, invalid JSON, missing versions and wrong shapes", function()
         support.response=function() return nil,"timeout",nil end
         local items,err=API.fetchCollectionPaginated("https://api.zotero.org/users/123/items",{})
@@ -53,7 +88,73 @@ describe("Zotero API offline regressions", function()
         assert(not items and err:find("JSON array",1,true))
     end)
 
-    it("does not apply staged items if fetching collections fails", function()
+    it("syncs updates, trash and permanent item/collection deletions together", function()
+        support.seed({OLDITEM1=support.attachment("OLDITEM1","old.pdf"),TRASHED1=support.attachment("TRASHED1","trash.pdf")},
+            {COLLECT1={key="COLLECT1",data={name="Old",parentCollection=false}}},10)
+        local fresh=support.attachment("NEWITEM1","new.pdf")
+        local trash=support.attachment("TRASHED1","trash.pdf");trash.data.deleted=1
+        support.response=function(req)
+            if req.url:find("/items?",1,true) then
+                assert(req.url:find("includeTrashed=1",1,true))
+                assert(req.headers["If-Modified-Since-Version"]=="10")
+            elseif req.url:find("/collections?",1,true) then
+                assert(not req.url:find("includeTrashed",1,true))
+            end
+            return default_sync(req,{fresh,trash},{},{items={"OLDITEM1"},collections={"COLLECT1"}})
+        end
+        assert(API.syncAllItems()==nil)
+        assert(API.getItems().NEWITEM1 and not API.getItems().OLDITEM1 and not API.getItems().TRASHED1)
+        assert(not API.getCollections().COLLECT1 and API.getLibraryVersion()==11)
+        API.init(support.directory)
+        assert(API.getItems().NEWITEM1 and API.getLibraryVersion()==11)
+        assert(#support.logs==0)
+    end)
+
+    it("keeps the cache on a conditional 304 and stops requesting the library", function()
+        support.seed({OLDITEM1=support.attachment("OLDITEM1","old.pdf")}, {},10)
+        local disk=support.read(API.cache_path)
+        support.response=function(req)
+            if req.url:find("/keys/current",1,true) then return support.key(req) end
+            return support.respond(req,nil,10,{},304)
+        end
+        assert(API.syncAllItems()==nil and #support.requests==2)
+        assert(API.getItems().OLDITEM1 and support.read(API.cache_path)==disk)
+    end)
+
+    it("restarts a changed library and commits only the consistent attempt", function()
+        support.seed({}, {},10)
+        local round=0
+        support.response=function(req)
+            if req.url:find("/keys/current",1,true) then return support.key(req) end
+            if req.url:find("/items?",1,true) then
+                round=round+1
+                return support.respond(req,{support.attachment(round==1 and "STALE001" or "LATEST01","paper.pdf")},round==1 and 11 or 12)
+            end
+            return default_sync(req,{},{},{items={},collections={}},12)
+        end
+        assert(API.syncAllItems()==nil and round==2)
+        assert(API.getLibraryVersion()==12 and API.getItems().LATEST01 and not API.getItems().STALE001)
+    end)
+
+    it("leaves the snapshot untouched when versions keep changing between pages", function()
+        support.seed({OLDITEM1=support.attachment("OLDITEM1","old.pdf")},{},10)
+        local disk=support.read(API.cache_path)
+        local rounds=0
+        support.response=function(req)
+            if req.url:find("/keys/current",1,true) then return support.key(req) end
+            if not req.url:find("start=100",1,true) then
+                rounds=rounds+1
+                return support.respond(req,{support.attachment("NEWITEM1","new.pdf")},11,
+                    {link='<https://api.zotero.org/users/123/items?since=10&start=100>; rel="next"'})
+            end
+            return support.respond(req,{},12)
+        end
+        assert(API.syncAllItems():find("changed",1,true) and rounds==3)
+        assert(API.getLibraryVersion()==10 and API.getItems().OLDITEM1 and not API.getItems().NEWITEM1)
+        assert(support.read(API.cache_path)==disk)
+    end)
+
+    it("does not apply staged items if fetching collections or deletion logs fails", function()
         support.seed({OLDITEM1=support.attachment("OLDITEM1","old.pdf")},{},10)
         local disk=support.read(API.cache_path)
         support.response=function(req)
@@ -62,6 +163,12 @@ describe("Zotero API offline regressions", function()
         end
         assert(API.syncAllItems():find("timeout",1,true))
         assert(support.read(API.cache_path)==disk and not API.getItems().NEWITEM1)
+        support.response=function(req)
+            if req.url:find("/deleted?",1,true) then return support.respond(req,{items=false,collections={}},11) end
+            return default_sync(req,{support.attachment("NEWITEM1","new.pdf")})
+        end
+        assert(API.syncAllItems():find("deletion log",1,true))
+        assert(support.read(API.cache_path)==disk)
     end)
 
     it("preserves the last snapshot if atomic publication fails", function()
@@ -118,10 +225,43 @@ describe("Zotero API offline regressions", function()
         assert(API.getLibraryVersion()==0 and not next(API.getItems()))
     end)
 
+    it("honors Retry-After without making more requests", function()
+        support.response=function(req) return support.respond(req,"rate limited",nil,{["retry-after"]="30"},429) end
+        assert(API.syncAllItems():find("retry in",1,true))
+        local count=#support.requests
+        assert(API.syncAllItems():find("retry in",1,true) and #support.requests==count)
+    end)
+
+    it("uses increasing fallback delays for repeated 429 responses", function()
+        support.response=function(req) return support.respond(req,"rate limited",nil,{},429) end
+        assert(API.syncAllItems() and API.backoff_until-os.time()>=59)
+        API.backoff_until=0
+        assert(API.syncAllItems() and API.backoff_until-os.time()>=119)
+    end)
+
+    it("finishes a sync receiving Backoff and delays the next sync", function()
+        support.response=function(req)
+            if req.url:find("/items?",1,true) then return support.respond(req,{},11,{backoff="30"}) end
+            return default_sync(req)
+        end
+        assert(API.syncAllItems()==nil and API.getLibraryVersion()==11)
+        local count=#support.requests
+        assert(API.syncAllItems():find("retry in",1,true) and #support.requests==count)
+    end)
+
+    it("delays new requests after a 503 Retry-After", function()
+        support.response=function(req) return support.respond(req,"maintenance",nil,{["retry-after"]="30"},503) end
+        assert(API.syncAllItems():find("503",1,true))
+        local count=#support.requests
+        assert(API.syncAllItems():find("retry in",1,true) and #support.requests==count)
+    end)
+
     it("reports WebDAV failures and checks only the configured directory", function()
         API.setWebDAVUrl("https://dav.invalid/zotero/")
         support.response=function(req)
-            assert(req.method=="PROPFIND" and req.url=="https://dav.invalid/zotero")
+            assert(req.headers.Depth=="0" and req.url=="https://dav.invalid/zotero")
+            local body=req.source()
+            assert(body:find('<propfind xmlns="DAV:">',1,true) and tonumber(req.headers["Content-Length"])==#body)
             return nil,"timeout",nil
         end
         assert(API.checkWebDAV():find("timeout",1,true))
@@ -161,8 +301,8 @@ describe("Zotero API offline regressions", function()
         assert(support.read(path)=="hello")
     end)
 
-    it("downloads PDFs and reuses the verified local cache offline", function()
-        local _,path=cached_attachment("imported_file",HELLO_MD5)
+    it("downloads imported_url PDFs and reuses the verified local cache offline", function()
+        local _,path=cached_attachment("imported_url",HELLO_MD5)
         support.response=function(req) return support.respond(req,"hello",nil,{etag='"'..HELLO_MD5..'"'}) end
         local result,err=API.downloadAndGetPath("ATTACH01")
         assert(result==path and not err and support.read(path)=="hello")
@@ -202,6 +342,8 @@ describe("Zotero API offline regressions", function()
         local directory,path=cached_attachment("imported_file",HELLO_MD5)
         support.response=function(req) return support.respond(req,"wrong",nil,{etag='"'..HELLO_MD5..'"'}) end
         assert(not API.downloadAndGetPath("ATTACH01") and support.read(path)=="old PDF")
+        support.response=function(req) return support.respond(req,"hello",nil,{etag='"'..string.rep("1",32)..'"'}) end
+        assert(not API.downloadAndGetPath("ATTACH01") and support.read(path)=="old PDF")
         API.getItems().ATTACH01.data.md5=nil
         support.response=function(req) return support.respond(req,"") end
         assert(not API.downloadAndGetPath("ATTACH01") and support.read(path)=="old PDF")
@@ -211,7 +353,7 @@ describe("Zotero API offline regressions", function()
         assert(not API.downloadAndGetPath("ATTACH01") and support.read(path)=="old PDF")
     end)
 
-    it("removes API keys on cross-origin redirects", function()
+    it("removes API keys on cross-origin redirects and preserves first-response file headers", function()
         local _,path=cached_attachment("imported_file",HELLO_MD5)
         support.response=function(req,index)
             assert(req.redirect==false)
@@ -223,7 +365,7 @@ describe("Zotero API offline regressions", function()
             return support.respond(req,"hello",nil,{etag='"'..HELLO_MD5..'"'})
         end
         local result,err=API.downloadAndGetPath("ATTACH01")
-        assert(result==path and not err and support.read(path)=="hello")
+        assert(not result and err:find("does not match",1,true) and support.read(path)=="old PDF")
         assert(#support.requests==2)
     end)
 
@@ -256,11 +398,11 @@ describe("Zotero API offline regressions", function()
         assert(not result and err:find("sink timeout",1,true) and support.read(path)=="old PDF")
     end)
 
-    it("extracts WebDAV ZIPs without overwrite prompts", function()
+    it("extracts current and legacy WebDAV ZIPs without overwrite prompts", function()
         local directory,path=cached_attachment("imported_file",HELLO_MD5)
         API.setWebDAVUrl("https://dav.invalid/zotero")
         support.settings_data.webdav_enabled=true
-        for _,fixture in ipairs({fixtures.plain}) do
+        for _,fixture in ipairs({fixtures.plain,fixtures.encoded}) do
             support.write(path,"old PDF")
             support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=10}))
             support.response=function(req) return support.respond(req,fixture.bytes) end
@@ -300,6 +442,29 @@ describe("Zotero API offline regressions", function()
         support.response=function(req) return support.respond(req,fixtures.special.bytes) end
         local path,err=API.downloadAndGetPath("ATTACH01")
         assert(path and not err and support.read(path)=="hello")
+    end)
+
+    it("checks ZIP storage hashes separately from the uncompressed attachment hash", function()
+        local _,path,item=cached_attachment("imported_file",HELLO_MD5)
+        item.data.mtime="1700000000123"
+        support.response=function(req,index)
+            if index==1 then
+                return support.respond(req,"redirect",nil,{location="https://storage.invalid/file",["zotero-file-compressed"]="Yes",
+                    ["zotero-file-md5"]=fixtures.plain.md5,["zotero-file-modification-time"]=item.data.mtime},302)
+            end
+            return support.respond(req,fixtures.plain.bytes,nil,{etag='"'..fixtures.plain.md5..'"'})
+        end
+        assert(API.downloadAndGetPath("ATTACH01")==path and support.read(path)=="hello")
+        assert(support.last_touch[3]==1700000000.123)
+    end)
+
+    it("keeps the existing PDF if a compressed download fails its storage checksum", function()
+        local _,path=cached_attachment("imported_file",HELLO_MD5)
+        support.response=function(req)
+            return support.respond(req,fixtures.plain.bytes,nil,{["zotero-file-compressed"]="Yes",["zotero-file-md5"]=string.rep("1",32)})
+        end
+        local result,err=API.downloadAndGetPath("ATTACH01")
+        assert(not result and err:find("ZIP",1,true) and support.read(path)=="old PDF")
     end)
 
     it("removes WebDAV credentials when a ZIP redirects to another host", function()

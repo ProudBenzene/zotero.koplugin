@@ -69,7 +69,6 @@ function Support.respond(req, value, version, headers, code)
     local body = type(value) == "table" and Support.JSON.encode(value) or value
     if body and req.sink then assert(req.sink(body)); assert(req.sink(nil)) end
     headers = headers or {}
-    if req.method == "HEAD" then headers["total-results"] = tostring(type(value) == "table" and #value or 1) end
     if version then headers["last-modified-version"] = tostring(version) end
     return 1, code or 200, headers
 end
