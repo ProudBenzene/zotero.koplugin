@@ -1,0 +1,33 @@
+# Local Zotero credentials, metadata and downloaded attachments
+/zotero/
+/meta.lua
+/items.json
+/collections.json
+/library.json
+/storage/
+
+# Lua bytecode and test output
+*.luac
+/luac.out
+/luacov.stats.out
+/luacov.report.out
+/coverage/
+
+# Generated build and tooling data
+/build/
+/dist/
+/.cache/
+/.codegraph/
+
+# Local editor files
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
