@@ -10,13 +10,9 @@ This addon for [KOReader](https://github.com/koreader/koreader) allows you to vi
 ## Features
 * Synchronize via Web API
 * Display collections, navigate to sub-collections
-* Download & open attached PDF files
+* Download & open attached PDF and EPUB files
 * Supports WebDAV storage backend
 * Search entries by the title of the publication, name of the first author or DOI.
-
-
-
-
 ## Installation Guide
 1. Copy the files in this repository to `<KOReader>/plugins/zotero.koplugin`
 2. Obtain an API token for your account by generating a new key in your [Zotero Settings](https://www.zotero.org/settings/keys). Note the userID and the private key.
@@ -35,12 +31,12 @@ If you are not interested in syncing your collection and would rather access you
 If you do not want to pay Zotero for more storage, you can also store the attachments in a WebDAV folder like [Nextcloud](https://nextcloud.com).
 You can read more about how to set up WebDAV in the [Zotero manual](https://www.zotero.org/support/sync).
 
-The WebDAV URL should point to a directory named zotero. If you use Nextcloud, it will look similar to this: [http://your-instance.tld/remote.php/dav/files/your-username/zotero](). It is probably a good idea to use an app password instead of your user password, so that you can easily revoke it in the security settings should you ever lose your device.
+The WebDAV URL should point to a directory named `zotero`, for example `https://your-instance.tld/remote.php/dav/files/your-username/zotero`. An app password can be used where the server supports it.
 
 ### Manual configuration
 
 If you do not want to type in the account credentials on your E-Reader, you can also edit the settings file directly.
-Edit the `zotero/meta.lua` file inside the koreader directory and supply needed values:
+Edit `<KOReader data directory>/zotero/meta.lua` and supply the needed values. The data directory varies by device/platform.
 ```lua
 -- we can read Lua syntax here!
 return {
@@ -52,3 +48,22 @@ return {
     ["webdav_password"] = "",
 }
 ```
+
+## Cache and upgrades
+
+After upgrading from the old implementation, run **Synchronize** once. The plugin rebuilds metadata using a full sync, then uses incremental updates. Metadata and its version are saved together in `zotero/library.json`; each PDF/EPUB has an independent directory at `zotero/storage/<userID>/<attachmentKey>/`.
+
+Old `items.json`, `collections.json`, downloaded documents and their KOReader sidecars are left in place. Old downloads are not reused automatically because their shared directories/version files cannot reliably identify the cached attachment; the first open downloads and verifies a new copy. Existing reading progress stays with the old path, so it is not transferred automatically to that copy. An explicit full resync retains the last good metadata snapshot until the replacement sync succeeds.
+
+Changing the user ID or API key invalidates the current metadata snapshot and starts a full sync for the configured account. Linked files/URLs, group libraries, local API access and annotation uploads are currently unsupported. This is a read-only plugin.
+
+## Development tests
+
+From the repository root, run:
+
+```sh
+lua tests/run.lua
+# or: luajit tests/run.lua
+```
+
+The offline suite uses KOReader/HTTP/JSON/crypto test doubles, real temporary files and real `unzip` operations. It requires no account credentials or network access. JSON and digest test doubles exercise protocol decisions, not the correctness of those external libraries. KOReader device integration and live Zotero/WebDAV interoperability still need separate validation.

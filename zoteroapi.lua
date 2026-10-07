@@ -1,694 +1,611 @@
 local BaseUtil = require("ffi/util")
 local LuaSettings = require("luasettings")
 local http = require("socket.http")
+local URL = require("socket.url")
+local socketutil = require("socketutil")
 local ltn12 = require("ltn12")
-local https = require("ssl.https")
 local JSON = require("json")
 local lfs = require("libs/libkoreader-lfs")
-local DocSettings = require("docsettings")
 local sha2 = require("ffi/sha2")
-
--- Functions expect config parameter, a lua table with the following keys:
--- zotero_dir: Path to a directory where cache files will be stored
--- api_key: self-explanatory
---
--- Directory layout of zoteroapi
--- /items.json: Contains all items
--- /storage/<KEY>/filename.pdf: Actual PDF files
--- /storage/<KEY>/version: Version number of downloaded attachment
--- /meta.lua: Metadata containing library version, items etc.
+local util = require("util")
 
 local API = {}
+local API_ROOT = "https://api.zotero.org"
+local CACHE_FORMAT = 1
+local LIBRARY_CHANGED = "The Zotero library changed during synchronization. Please retry."
+local SUPPORTED_MEDIA_TYPES = { ["application/pdf"] = true, ["application/epub+zip"] = true }
 
-local SUPPORTED_MEDIA_TYPES = {
-    [1] = "application/pdf",
-    [2] = "application/epub+zip"
-}
-
-local function joinTables(target, source)
-    return table.move(source, 1, #source, #target + 1, target)
+local function trim(value)
+    return tostring(value or ""):match("^%s*(.-)%s*$")
 end
 
 local function file_exists(path)
-    if path == nil then return nil end
-    return lfs.attributes(path) ~= nil
-end
-
-local function table_contains(t, search_value)
-    for k, v in pairs(t) do
-        if v == search_value then
-            return true
-        end
-    end
-
-    return false
+    return path ~= nil and lfs.attributes(path, "mode") == "file"
 end
 
 local function file_slurp(path)
-    if not file_exists(path) then
-        return nil
-    end
-    local f = io.open(path, "r")
-
-    if f == nil then
-        return nil
-    end
-
-    local content = f:read("*all")
+    local f, err = io.open(path, "rb")
+    if not f then return nil, err end
+    local content = f:read("*a")
     f:close()
     return content
 end
 
-function API.cutDecimalPlaces(x, num_places)
-    local fac = 10^num_places
-    return math.floor(x * fac) / fac
-end
-
-function API.init(zotero_dir)
-    print("Z: initializing API")
-    API.zotero_dir = zotero_dir
-    local settings_path = BaseUtil.joinPath(API.zotero_dir, "meta.lua")
-    print(settings_path)
-    API.settings = LuaSettings:open(settings_path)
-    print("Z: settings opened")
-
-    API.storage_dir = BaseUtil.joinPath(API.zotero_dir, "storage")
-    if not file_exists(API.storage_dir) then
-        lfs.mkdir(API.storage_dir)
+local function write_atomic(path, content)
+    local temporary = path .. ".tmp"
+    local f, err = io.open(temporary, "wb")
+    if not f then return nil, err end
+    local written, write_err = f:write(content)
+    local closed, close_err = f:close()
+    if not written or not closed then
+        os.remove(temporary)
+        return nil, write_err or close_err
     end
-
-    print("Z: storage dir" .. API.storage_dir)
+    local ok, rename_err = os.rename(temporary, path)
+    if not ok then os.remove(temporary) end
+    return ok, rename_err
 end
 
-function API.getAPIKey()
-    return API.settings:readSetting("api_key")
-end
-function API.setAPIKey(api_key)
-    API.settings:saveSetting("api_key", api_key)
-end
-
-function API.getUserID()
-    return API.settings:readSetting("user_id")
+local function write_json(path, value)
+    local ok, content = pcall(JSON.encode, value)
+    if not ok then return nil, "Could not encode cache data" end
+    return write_atomic(path, content)
 end
 
-function API.setUserID(user_id)
-    API.settings:saveSetting("user_id", user_id)
+local function read_json(path)
+    local content, err = file_slurp(path)
+    if not content then return nil, err end
+    local ok, data = pcall(JSON.decode, content)
+    if not ok or type(data) ~= "table" then return nil, "Invalid JSON data" end
+    return data
 end
 
-function API.getWebDAVEnabled()
-    return API.settings:isTrue("webdav_enabled")
-end
-function API.getWebDAVUser()
-    return API.settings:readSetting("webdav_user")
-end
-
-function API.getWebDAVPassword()
-    return API.settings:readSetting("webdav_password")
+local function copy_table(source)
+    local target = {}
+    for key, value in pairs(source) do target[key] = value end
+    return target
 end
 
-function API.getWebDAVUrl()
-    return API.settings:readSetting("webdav_url")
-end
-
-function API.toggleWebDAVEnabled()
-    API.settings:toggle("webdav_enabled")
-end
-
-function API.setWebDAVUser(user)
-    API.settings:saveSetting("webdav_user", user)
-end
-
-function API.setWebDAVPassword(password)
-    API.settings:saveSetting("webdav_password", password)
-end
-
-function API.setWebDAVUrl(url)
-    API.settings:saveSetting("webdav_url", url)
-end
-
-function API.getLibraryVersion()
-    return API.settings:readSetting("library_version_nr", "0")
-end
-
-function API.setLibraryVersion(version)
-    return API.settings:saveSetting("library_version_nr", version)
-end
-
--- Retrieve underlying settings object to make changes from the outside
-function API.getSettings()
-    return API.settings
-end
-
-
--- Check that a webdav connection works by performing a PROPFIND operation on the
--- URL with the associated credentials.
--- returns nil if no problems where found, otherwise error string
-function API.checkWebDAV()
-    local url = API.getWebDAVUrl()
-    if url == nil then
-        return "No WebDAV URL provided"
+local function contains(values, value)
+    if type(values) ~= "table" then return false end
+    for _, candidate in pairs(values) do
+        if candidate == value then return true end
     end
+    return false
+end
 
-    local user = API.getWebDAVUser()
-    local pass = API.getWebDAVPassword()
-    local headers = API.getWebDAVHeaders()
-
-    local b, c, h = http.request {
-        url = url,
-        method = "PROPFIND",
-        headers = headers
-    }
-
-    if c == 200 or c == 207 then
-        return nil
-    elseif c == 400 or c == 401 then
-        return "Reached server, but access forbidden. Check username and password."
+local function header(headers, name)
+    for key, value in pairs(headers or {}) do
+        if key:lower() == name then return value end
     end
-
-
-end
-
--- List of zotero items that need to be synced to the server.  Items that are
--- modified will have a "key" property, new items will not carry this property.
-function API.getModifiedItems()
-    if API.modified_items == nil then
-        API.modified_items = API.settings:readSetting("modified_items", {})
-    end
-
-    return API.modified_items
-end
-
-
--- This just syncs them to disk, it will not modify the Zotero collection!
-function API.saveModifiedItems()
-    API.settings:flush()
-end
-
-function API.getFilterTag()
-    return API.settings:readSetting("filter_tag", "")
-end
-
-function API.setFilterTag(tag)
-    return API.settings:saveSetting("filter_tag", tag)
-end
-
-function API.setItems(items)
-    API.items = items
-    local f = assert(io.open(BaseUtil.joinPath(API.zotero_dir, "items.json"), "w"))
-    local content = JSON.encode(API.items)
-    f:write(content)
-    f:close()
-end
-
-function API.getItems()
-    if API.items == nil then
-        local path = BaseUtil.joinPath(API.zotero_dir, "items.json")
-        local file_exists = lfs.attributes(path)
-
-        if not file_exists then
-            API.items = {}
-        else
-            API.items = JSON.decode(file_slurp(path))
-        end
-    end
-
-    return API.items
-end
-
-function API.getCollections()
-    if API.collections == nil then
-        local path = BaseUtil.joinPath(API.zotero_dir, "collections.json")
-        local file_exists = lfs.attributes(path)
-
-        if not file_exists then
-            API.collections = {}
-        else
-            API.collections = JSON.decode(file_slurp(path))
-        end
-    end
-
-    return API.collections
-end
-
-function API.setCollections(collections)
-    API.collections = collections
-    local f = assert(io.open(BaseUtil.joinPath(API.zotero_dir, "collections.json"), "w"))
-    local content = JSON.encode(API.collections)
-    f:write(content)
-    f:close()
-end
-
-function API.verifyResponse(r, c)
-    if r ~= 1 then
-        return ("Error: " .. c)
-    elseif c ~= 200 then
-        return ("Error: API responded with status code " .. c)
-    end
-
     return nil
 end
 
-function API.fetchCollectionSize(collection_url, headers)
-    print("Determining size of '" .. collection_url .. "'")
-    local r, c, h = http.request {
-        method = "HEAD",
-        url = collection_url,
-        headers = headers
-    }
-
-    local e = API.verifyResponse(r, c)
-    if e ~= nil then return nil, e end
-
-    local total_results = tonumber(h["total-results"])
-    if total_results == nil or total_results < 0 then
-        return nil, "Error: could not determine number of items in library"
+local function origin(url)
+    local parsed = URL.parse(url)
+    if not parsed or (parsed.scheme ~= "https" and parsed.scheme ~= "http") or not parsed.host then
+        return nil
     end
-
-    return tonumber(total_results)
+    return parsed.scheme .. "://" .. parsed.host:lower() .. ":" ..
+        tostring(parsed.port or (parsed.scheme == "https" and 443 or 80))
 end
 
--- Fetches a paginated URL collection.
---
--- If no callback is given, it returns an array containing all entries of the collection.
---
--- If a callback is given, it will be called with the entries on each page as they are fetched
--- and the function will return the version number.
---
--- If an error occurs, the function will return nil and the error message as second parameter.
-function API.fetchCollectionPaginated(collection_url, headers, callback)
-    -- Try to determine the size
-    local collection_size, e = API.fetchCollectionSize(collection_url, headers)
-    if e ~= nil then return nil, e end
+local function account_fingerprint()
+    return sha2.sha256(API.getAPIKey() or "")
+end
 
-    print(("Fetching %s items."):format(collection_size))
-    -- The API returns the results in pages with 100 entries each, loop accordingly.
-    local items = {}
-    local library_version = 0
-    local step_size = 100
-    for item_nr = 0, collection_size, step_size do
-        local page_url = ("%s&limit=%i&start=%i"):format(collection_url, step_size, item_nr)
-        print("Fetching page ", item_nr, page_url)
+local function empty_state()
+    return {
+        format = CACHE_FORMAT,
+        user_id = trim(API.getUserID()),
+        key_fingerprint = account_fingerprint(),
+        version = 0,
+        items = {},
+        collections = {},
+    }
+end
 
-        local page_data = {}
-        local r, c, h = http.request {
-            method = "GET",
-            url = page_url,
-            headers = headers,
-            sink = ltn12.sink.table(page_data)
-        }
-
-        library_version = h["last-modified-version"]
-
-        local e = API.verifyResponse(r, c)
-        if e ~= nil then return nil, e end
-
-        local content = table.concat(page_data, "")
-        local ok, result = pcall(JSON.decode, content)
-        if not ok then
-            return nil, "Error: failed to parse JSON in response"
+local function get_state()
+    if not API.state then
+        local state
+        if file_exists(API.cache_path) then
+            local err
+            state, err = read_json(API.cache_path)
+            if not state then error("Could not read Zotero cache: " .. tostring(err)) end
+            if state.format ~= CACHE_FORMAT or type(state.items) ~= "table"
+                or type(state.collections) ~= "table" or not tonumber(state.version) then
+                error("Invalid Zotero cache. Use Maintenance > Resync entire collection.")
+            end
         end
-
-        if callback then
-            callback(result)
-        else
-            -- add items to the list we return in the end
-            table.move(result, 1, #result, #items + 1, items)
+        if not state or state.user_id ~= trim(API.getUserID())
+            or state.key_fingerprint ~= account_fingerprint() then
+            state = empty_state()
         end
+        API.state = state
     end
+    return API.state
+end
 
-    if callback then
-        return library_version, nil
-    else
-        return items, nil
+local function save_state(state)
+    local ok, err = write_json(API.cache_path, state)
+    if not ok then return nil, "Could not save Zotero cache: " .. tostring(err) end
+    API.state = state
+    return true
+end
+
+local function update_storage_dir(user_id)
+    local storage_dir = BaseUtil.joinPath(API.zotero_dir, "storage")
+    user_id = trim(user_id or API.getUserID())
+    if user_id:match("^%d+$") then
+        storage_dir = BaseUtil.joinPath(storage_dir, user_id)
     end
+    local ok, err = util.makePath(storage_dir)
+    if ok then API.storage_dir = storage_dir end
+    return ok, err
+end
 
+function API.init(zotero_dir)
+    local ok, err = util.makePath(zotero_dir)
+    if not ok then error("Could not create Zotero directory: " .. tostring(err)) end
+    API.zotero_dir = zotero_dir
+    API.settings = LuaSettings:open(BaseUtil.joinPath(zotero_dir, "meta.lua"))
+    API.cache_path = BaseUtil.joinPath(zotero_dir, "library.json")
+    API.state = nil
+    ok, err = update_storage_dir()
+    if not ok then error("Could not create attachment storage: " .. tostring(err)) end
+end
+
+function API.getAPIKey() return API.settings:readSetting("api_key") end
+function API.getUserID() return API.settings:readSetting("user_id") end
+
+function API.setAPIKey(api_key)
+    api_key = trim(api_key)
+    if API.getAPIKey() ~= api_key then API.state = nil end
+    API.settings:saveSetting("api_key", api_key)
+end
+
+function API.setUserID(user_id)
+    user_id = trim(user_id)
+    if not user_id:match("^%d+$") then return nil, "The User ID must be an integer number." end
+    local ok, err = update_storage_dir(user_id)
+    if not ok then return nil, "Could not create attachment storage: " .. tostring(err) end
+    if trim(API.getUserID()) ~= user_id then API.state = nil end
+    API.settings:saveSetting("user_id", user_id)
+    return true
+end
+
+function API.getWebDAVEnabled() return API.settings:isTrue("webdav_enabled") end
+function API.getWebDAVUser() return API.settings:readSetting("webdav_user") end
+function API.getWebDAVPassword() return API.settings:readSetting("webdav_password") end
+function API.getWebDAVUrl() return API.settings:readSetting("webdav_url") end
+function API.toggleWebDAVEnabled()
+    API.settings:toggle("webdav_enabled")
+    API.saveSettings()
+end
+function API.setWebDAVUser(user) API.settings:saveSetting("webdav_user", user) end
+function API.setWebDAVPassword(password) API.settings:saveSetting("webdav_password", password) end
+function API.setWebDAVUrl(url) API.settings:saveSetting("webdav_url", trim(url):gsub("/+$", "")) end
+function API.getSettings() return API.settings end
+function API.saveSettings() API.settings:flush() end
+-- Kept for callers of the old settings-flush helper; this plugin is read-only.
+API.saveModifiedItems = API.saveSettings
+
+function API.getLibraryVersion()
+    if API.settings:isTrue("force_full_sync") then return 0 end
+    return tonumber(get_state().version)
+end
+
+function API.getItems() return get_state().items end
+function API.getCollections() return get_state().collections end
+
+function API.setItems(items)
+    local state = copy_table(get_state())
+    state.items = items
+    return save_state(state)
+end
+function API.setCollections(collections)
+    local state = copy_table(get_state())
+    state.collections = collections
+    return save_state(state)
+end
+function API.setLibraryVersion(version)
+    local state = copy_table(get_state())
+    state.version = assert(tonumber(version), "Invalid library version")
+    return save_state(state)
+end
+
+function API.resetSyncState()
+    -- Keep the last good snapshot available offline until a full sync succeeds.
+    API.settings:saveSetting("force_full_sync", true)
+    API.saveSettings()
+    -- An explicitly requested resync can also recover an unreadable snapshot.
+    local ok = pcall(get_state)
+    if not ok then API.state = empty_state() end
 end
 
 function API.ensureKeyAndID()
-    local user_id = API.settings:readSetting("user_id", "")
-    local api_key = API.settings:readSetting("api_key", "")
-
-    if user_id == "" then
-        return "Error: must set User ID"
-    elseif api_key == "" then
-        return "Error: must set API Key"
-    end
-
+    local user_id, api_key = trim(API.getUserID()), trim(API.getAPIKey())
+    if not user_id:match("^%d+$") then return "Error: must set a numeric User ID" end
+    if api_key == "" then return "Error: must set API Key" end
     return nil, api_key, user_id
 end
 
 function API.getHeaders(api_key)
-    return {
-        ["zotero-api-key"] = api_key,
-        ["zotero-api-version"] = "3"
-    }
+    return { ["Zotero-API-Key"] = api_key, ["Zotero-API-Version"] = "3" }
 end
 
-function API.syncAllItems()
+local function request(req, is_file)
+    local previous_block, previous_total = socketutil.block_timeout, socketutil.total_timeout
+    local total_timeout = is_file and socketutil.FILE_TOTAL_TIMEOUT or socketutil.LARGE_TOTAL_TIMEOUT
+    socketutil:set_timeout(is_file and socketutil.FILE_BLOCK_TIMEOUT or socketutil.LARGE_BLOCK_TIMEOUT, total_timeout)
+    if req.sink then
+        local sink, started = req.sink, os.time()
+        req.sink = function(chunk, err)
+            if os.time() - started > total_timeout then return nil, "sink timeout" end
+            return sink(chunk, err)
+        end
+    end
+    local ok, result, code, headers = pcall(http.request, req)
+    socketutil:set_timeout(previous_block, previous_total)
+    if type(headers) ~= "table" then headers = {} end
+    if not ok then return nil, "Network request failed: " .. tostring(result), {} end
+    return result, code, headers
+end
+
+function API.verifyResponse(result, code)
+    if result ~= 1 then return "Error: " .. tostring(code or "request failed") end
+    if code ~= 200 then return "Error: API responded with status code " .. tostring(code) end
+end
+
+local function fetch_json(url, headers)
+    local response = {}
+    local result, code, response_headers = request{
+        method = "GET", url = url, headers = headers, redirect = false,
+        sink = ltn12.sink.table(response),
+    }
+    local err = API.verifyResponse(result, code)
+    if err then return nil, err end
+    local ok, data = pcall(JSON.decode, table.concat(response))
+    if not ok or type(data) ~= "table" then return nil, "Error: failed to parse JSON in response" end
+    return data, nil, response_headers
+end
+
+local function response_version(headers)
+    local version = tonumber(header(headers, "last-modified-version"))
+    if not version or version < 0 or version % 1 ~= 0 then
+        return nil, "Error: missing or invalid Last-Modified-Version header"
+    end
+    return version
+end
+
+function API.fetchCollectionSize(collection_url, headers)
+    local result, code, response_headers = request{method = "HEAD", url = collection_url, headers = headers, redirect = false}
+    local err = API.verifyResponse(result, code)
+    if err then return nil, err end
+    local total = tonumber(header(response_headers, "total-results"))
+    if not total or total < 0 then return nil, "Error: could not determine number of items in library" end
+    return total
+end
+
+-- All pages must belong to the same library version. Callbacks should stage changes.
+-- Without a callback, the third return value is the library version.
+function API.fetchCollectionPaginated(collection_url, headers, callback, expected_version)
+    local total, err = API.fetchCollectionSize(collection_url, headers)
+    if err then return nil, err end
+    local separator = collection_url:find("?", 1, true) and "&" or "?"
+    local items, version = {}, expected_version
+    -- Even an empty library needs one GET to obtain its version.
+    for start = 0, math.max(total - 1, 0), 100 do
+        local page_url = collection_url .. separator .. "limit=100&start=" .. start
+        local data, response_headers
+        data, err, response_headers = fetch_json(page_url, headers)
+        if err then return nil, err end
+        local page_version
+        page_version, err = response_version(response_headers)
+        if err then return nil, err end
+        if version and version ~= page_version then return nil, LIBRARY_CHANGED end
+        version = page_version
+        for index in pairs(data) do
+            if type(index) ~= "number" or index < 1 or index % 1 ~= 0 or index > #data then
+                return nil, "Error: expected a JSON array in Zotero response"
+            end
+        end
+        for _, item in ipairs(data) do
+            if type(item) ~= "table" or type(item.key) ~= "string" or type(item.data) ~= "table" then
+                return nil, "Error: invalid object in Zotero response"
+            end
+            if not callback then items[#items + 1] = item end
+        end
+        if callback then callback(data) end
+    end
+    if callback then return version end
+    return items, nil, version
+end
+
+local function sync_library(api_key, user_id)
+    local state = get_state()
     local since = API.getLibraryVersion()
-
-    local e, api_key, user_id = API.ensureKeyAndID()
-    if e ~= nil then return e end
-    print(e, api_key, user_id)
-
     local headers = API.getHeaders(api_key)
-    local items_url = ("https://api.zotero.org/users/%s/items?since=%s&includeTrashed=true"):format(user_id, since)
-    local collections_url = ("https://api.zotero.org/users/%s/collections?since=%s&includeTrashed=true"):format(user_id, since)
-
-    -- Sync library items
-    local items = API.getItems()
-    print("loaded items: " .. #items)
-    local r, e = API.fetchCollectionPaginated(items_url, headers, function(partial_entries)
-        print("Received callback, processing entries: " .. #partial_entries)
-        for i = 1, #partial_entries do
-            -- Ruthlessly update our local items
-            local item = partial_entries[i]
-            local key = item.key
-
-            -- Check if item was deleted.
-            -- Server either sets deleted to true or 1, so we need to check for both
-            if item.data ~= nil and (item.data.deleted == 1 or item.data.deleted == true) then
-                items[key] = nil
-            else
-                items[key] = item
+    local prefix = API_ROOT .. "/users/" .. user_id
+    local items = since == 0 and {} or copy_table(state.items)
+    local collections = since == 0 and {} or copy_table(state.collections)
+    local function merge(target)
+        return function(entries)
+            for _, item in ipairs(entries) do
+                if item.data.deleted == true or item.data.deleted == 1 then target[item.key] = nil
+                else target[item.key] = item end
             end
         end
-    end)
-    if e ~= nil then return e end
-    API.setItems(items)
-
-    -- Sync library collections
-    local collections = API.getCollections()
-    local r, e = API.fetchCollectionPaginated(collections_url, headers, function(partial_entries)
-        print("Received callback, processing entries: " .. #partial_entries)
-        for i = 1, #partial_entries do
-            -- Ruthlessly update our local items
-            local collection = partial_entries[i]
-            local key = collection.key
-            if collection.data ~= nil and (collection.data.deleted == 1 or collection.data.deleted == true) then
-                collections[key] = nil
-            else
-                collections[key] = collection
-            end
-        end
-    end)
-    if e ~= nil then return e end
-    API.setCollections(collections)
-
-    API.setLibraryVersion(r)
-    API.settings:flush()
-
+    end
+    local version, err = API.fetchCollectionPaginated(prefix .. "/items?since=" .. since .. "&includeTrashed=true", headers, merge(items))
+    if err then return err end
+    if version < since then return "The library version went backwards. Please resync the entire collection." end
+    local collection_version
+    collection_version, err = API.fetchCollectionPaginated(prefix .. "/collections?since=" .. since .. "&includeTrashed=true", headers, merge(collections), version)
+    if err then return err end
+    if collection_version ~= version then return LIBRARY_CHANGED end
+    local snapshot = empty_state()
+    snapshot.items, snapshot.collections, snapshot.version = items, collections, version
+    local ok
+    ok, err = save_state(snapshot)
+    if not ok then return err end
+    API.settings:saveSetting("force_full_sync", false)
+    API.saveSettings()
     return nil
 end
 
--- If a tag is set, ensure all entries actually have that tag and it has not been removed
--- If no tag is set, just remove all deleted entries from the library
-function API.purgeEntries()
-
-end
-
-function API.getDirAndPath(attachmentKey)
-    local items = API.getItems()
-    local attachment = items[attachmentKey]
-
-    if attachment == nil then
-        return nil, nil
-    end
-
-    local targetDir = API.storage_dir .. "/"
-    if attachment.data.parentItem ~= nil then
-        targetDir = targetDir .. attachment.data.parentItem
-    else
-        targetDir = targetDir .. attachmentKey
-    end
-    local targetPath = targetDir .. "/" .. attachment.data.filename
-
-    return targetDir, targetPath
-end
-
--- Downloads an attachment file to the correct directory and returns the path.
--- If the local version is up to date, no network request is made.
--- Before the download, the download_callback is called.
--- Returns tuple with path and error, if path is correct then error is nil.
-function API.downloadAndGetPath(key, download_callback)
-    local e, api_key, user_id = API.ensureKeyAndID()
-    if e ~= nil then return nil, e end
-
-    local items = API.getItems()
-    if items[key] == nil then
-        return nil, "Error: the requested file can not be found in the database"
-    end
-    local item = items[key]
-
-    if item.data.itemType ~= "attachment" then
-        return nil, "Error: this item is not an attachment"
-    end
-
-    if item.data.linkMode == "linked_file" then
-        return nil, "Error: this item is a linked attachment. Linked attachments are currently unsupported."
-    end
-
-    if item.data.linkMode ~= "imported_file" then
-        return nil, "Error: unsupported link mode '" .. tostring(item.data.linkMode) .. "'."
-    end
-
-    local attachment = item
-
-    local targetDir, targetPath = API.getDirAndPath(key)
-    lfs.mkdir(targetDir)
-
-    local local_version = tonumber(file_slurp(targetDir .. "/version"))
-
-    if local_version ~= nil and local_version >= attachment.version and file_exists(targetPath) then
-        return targetPath, nil -- all done, local file is up to date
-    end
-
-    if download_callback ~= nil then download_callback() end
-
-    if API.settings:isTrue("webdav_enabled") then
-        local result, errormsg = API.downloadWebDAV(key, targetDir, targetPath)
-        if result == nil then
-            return nil, errormsg
-        end
-    else
-        local url = "https://api.zotero.org/users/" .. API.getUserID() .. "/items/" .. key .. "/file"
-        print("Fetching " .. url)
-
-        local r, c, h = http.request {
-            url = url,
-            headers = API.getHeaders(api_key),
-            redirect = true,
-            sink = ltn12.sink.file(io.open(targetPath, "wb"))
-        }
-
-        local e = API.verifyResponse(r, c)
-        if e ~= nil then return nil, e end
-    end
-
-    local versionFile = io.open(targetDir .. "/version", "w")
-    if versionFile == nil then
-        return nil, "Could not write version file"
-    end
-    versionFile:write(tostring(attachment.version))
-    versionFile:close()
-
-    return targetPath, nil
-end
-
-function API.downloadWebDAV(key, targetDir, targetPath)
-    if API.getWebDAVUrl() == nil then
-        return nil, "WebDAV url not set"
-    end
-    local url = API.getWebDAVUrl() .. "/" .. key .. ".zip"
-    local headers = API.getWebDAVHeaders()
-    local zipPath = targetDir .. "/" .. key .. ".zip"
-    print("Fetching URL " .. url)
-    local r, c, h = http.request {
-        method = "GET",
-        url = url,
-        headers = headers,
-        redirect = true,
-        sink = ltn12.sink.file(io.open(zipPath, "wb"))
-    }
-
-    if c ~= 200 then
-        return nil, "Download failed with status code " .. c
-    end
-
-    -- Zotero WebDAV storage packs documents inside a zipfile
-    local zip_cmd = "unzip -qq '" .. zipPath .. "' -d '" .. targetDir .. "'"
-    print("Unzipping with " .. zip_cmd)
-    local zip_result = os.execute(zip_cmd)
-    if zip_result then
-        return targetPath
-    else
-        return nil, "Unzipping failed"
-    end
-
-    local remove_result = os.remove(zipPath)
+function API.syncAllItems()
+    local err, api_key, user_id = API.ensureKeyAndID()
+    if err then return err end
+    local ok, result = pcall(sync_library, api_key, user_id)
+    if not ok then return "Could not synchronize Zotero: " .. tostring(result) end
+    return result
 end
 
 function API.getWebDAVHeaders()
-    local user = API.getWebDAVUser() or ""
-    local pass = API.getWebDAVPassword() or ""
-
-    return {
-        ["Authorization"] = "Basic " .. sha2.bin_to_base64(user .. ":" .. pass)
-    }
+    return { ["Authorization"] = "Basic " .. sha2.bin_to_base64((API.getWebDAVUser() or "") .. ":" .. (API.getWebDAVPassword() or "")) }
 end
 
--- Return a table of entries of a collection.
---
--- If key is nil, entries of the root collection will be given.
--- Each entry is a table with at least two values, the key and name.
--- Collections will have a display name that ends with a slash and contain true
--- under the key "collection" in their table.
+function API.checkWebDAV()
+    local url = trim(API.getWebDAVUrl())
+    if not origin(url) then return "A valid HTTP or HTTPS WebDAV URL is required" end
+    local headers = API.getWebDAVHeaders()
+    local result, code = request{url = url, method = "PROPFIND", headers = headers, redirect = false, sink = ltn12.sink.table({})}
+    if result ~= 1 then return "Connection failed: " .. tostring(code) end
+    if code == 200 or code == 207 then return nil end
+    if code == 401 or code == 403 then return "Access forbidden. Check username and password." end
+    return "WebDAV responded with status code " .. tostring(code)
+end
+
+function API.getDirAndPath(attachment_key)
+    local attachment = API.getItems()[attachment_key]
+    if not attachment or type(attachment.data) ~= "table" then return nil, nil, "Attachment not found" end
+    local filename = attachment.data.filename
+    if type(attachment_key) ~= "string" or not attachment_key:match("^[A-Z0-9]+$")
+        or type(filename) ~= "string" or filename == "" or filename == "." or filename == ".."
+        or filename:find("[/\\%z]") or filename:match("^%.zotero%-") then
+        return nil, nil, "Invalid attachment key or filename"
+    end
+    local directory = BaseUtil.joinPath(API.storage_dir, attachment_key)
+    return directory, BaseUtil.joinPath(directory, filename)
+end
+
+local function without_credentials(headers)
+    local sanitized = {}
+    for name, value in pairs(headers) do
+        local lower = name:lower()
+        if lower ~= "zotero-api-key" and lower ~= "authorization" and lower ~= "cookie" then sanitized[name] = value end
+    end
+    return sanitized
+end
+
+-- Explicit redirects prevent API keys and WebDAV passwords reaching a storage host.
+local function download_file(url, headers, path)
+    for redirect = 0, 5 do
+        if not origin(url) then return nil, "Invalid download URL" end
+        local f, err = io.open(path, "wb")
+        if not f then return nil, "Could not create download file: " .. tostring(err) end
+        local result, code, response_headers = request({
+            url = url, headers = headers, redirect = false,
+            sink = function(chunk)
+                if chunk then return f:write(chunk) end
+                return 1
+            end,
+        }, true)
+        local closed, close_err = f:close()
+        if not closed then os.remove(path); return nil, "Could not save download: " .. tostring(close_err) end
+        if result == 1 and (code == 301 or code == 302 or code == 303 or code == 307 or code == 308) then
+            os.remove(path)
+            local location = header(response_headers, "location")
+            if not location then return nil, "Missing download redirect location" end
+            local next_url = URL.absolute(url, location)
+            if url:match("^https:") and not next_url:match("^https:") then return nil, "Refusing an HTTPS download redirect to HTTP" end
+            if origin(next_url) ~= origin(url) then headers = without_credentials(headers) end
+            url = next_url
+        else
+            err = API.verifyResponse(result, code)
+            if err then os.remove(path); return nil, err end
+            return true, nil, response_headers
+        end
+    end
+    os.remove(path)
+    return nil, "Too many download redirects"
+end
+
+local function shell_quote(value)
+    return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local function command_succeeded(result)
+    return result == true or result == 0 -- Lua 5.2+ and LuaJIT/Lua 5.1, respectively
+end
+
+local function extract_archive(zip_path, filename, target_path)
+    local temporary = target_path .. ".part"
+    local names = { filename }
+    local extracted = false
+    for _, name in ipairs(names) do
+        local pattern = name:gsub("([%[%]%*%?\\])", "\\%1")
+        local command = "unzip -p " .. shell_quote(zip_path) .. " " .. shell_quote(pattern) .. " > " .. shell_quote(temporary)
+        local ran, result = pcall(os.execute, command)
+        if ran and command_succeeded(result) and file_exists(temporary) then extracted = true; break end
+    end
+    if not extracted then os.remove(temporary); return nil, "Could not extract the attachment from its WebDAV archive" end
+    local renamed, rename_err = os.rename(temporary, target_path)
+    if not renamed then os.remove(temporary); return nil, "Could not save extracted attachment: " .. tostring(rename_err) end
+    return target_path
+end
+
+function API.downloadWebDAV(key, target_dir, target_path)
+    local url = trim(API.getWebDAVUrl()):gsub("/+$", "")
+    if not origin(url) then return nil, "A valid HTTP or HTTPS WebDAV URL is required" end
+    local zip_path = target_dir .. "/.zotero-download.zip"
+    local ok, err = download_file(url .. "/" .. key .. ".zip", API.getWebDAVHeaders(), zip_path)
+    if not ok then return nil, err end
+    local path
+    path, err = extract_archive(zip_path, API.getItems()[key].data.filename, target_path)
+    os.remove(zip_path)
+    return path, err
+end
+
+local function attachment_md5(attachment)
+    local digest = attachment.data.md5
+    if type(digest) == "string" and #digest == 32 and digest:match("^%x+$") then return digest:lower() end
+end
+
+local function file_md5(path)
+    local f, err = io.open(path, "rb")
+    if not f then return nil, err end
+    local update = sha2.md5()
+    while true do
+        local chunk = f:read(65536)
+        if not chunk then break end
+        update(chunk)
+    end
+    f:close()
+    return update()
+end
+
+local function download_attachment(key, download_callback)
+    local err, api_key, user_id = API.ensureKeyAndID()
+    if err then return nil, err end
+    local attachment = API.getItems()[key]
+    if not attachment or not attachment.data then return nil, "The attachment was not found in the library" end
+    if attachment.data.itemType ~= "attachment" then return nil, "This item is not an attachment" end
+    local mode = attachment.data.linkMode
+    if mode ~= "imported_file" then
+        return nil, "Unsupported attachment link mode: " .. tostring(mode) .. ". Linked files and linked URLs are not stored by Zotero."
+    end
+    if not SUPPORTED_MEDIA_TYPES[attachment.data.contentType] then return nil, "Only PDF and EPUB attachments are supported" end
+    local target_dir, target_path, path_err = API.getDirAndPath(key)
+    if not target_path then return nil, path_err end
+    local ok
+    ok, err = util.makePath(target_dir)
+    if not ok then return nil, "Could not create attachment directory: " .. tostring(err) end
+    local metadata_path = target_dir .. "/.zotero-cache.json"
+    local metadata = read_json(metadata_path)
+    local md5 = attachment_md5(attachment)
+    local cached_attributes = lfs.attributes(target_path)
+    local version = tonumber(attachment.version)
+    if metadata and cached_attributes and cached_attributes.mode == "file" and cached_attributes.size > 0
+        and ((md5 and metadata.md5 == md5) or (not md5 and version and tonumber(metadata.version) == version)) then
+        return target_path
+    end
+    if download_callback then download_callback() end
+    local temporary = target_dir .. "/.zotero-download.part"
+    local response_headers
+    if API.getWebDAVEnabled() then
+        local path
+        path, err = API.downloadWebDAV(key, target_dir, temporary)
+        ok = path ~= nil
+    else
+        ok, err, response_headers = download_file(API_ROOT .. "/users/" .. user_id .. "/items/" .. key .. "/file", API.getHeaders(api_key), temporary)
+    end
+    if not ok then os.remove(temporary); return nil, err end
+    if md5 and file_md5(temporary) ~= md5 then
+        os.remove(temporary)
+        return nil, "The downloaded file does not match Zotero's attachment metadata. Synchronize the library and retry."
+    end
+    local attributes = lfs.attributes(temporary)
+    if not attributes or attributes.size == 0 then os.remove(temporary); return nil, "The downloaded attachment is empty" end
+    ok, err = os.rename(temporary, target_path)
+    if not ok then os.remove(temporary); return nil, "Could not save attachment: " .. tostring(err) end
+    ok, err = write_json(metadata_path, { version = attachment.version, md5 = md5 })
+    if not ok then return nil, "Could not save attachment metadata: " .. tostring(err) end
+    return target_path
+end
+
+function API.downloadAndGetPath(key, download_callback)
+    local ok, path, err = pcall(download_attachment, key, download_callback)
+    if not ok then return nil, "Could not download attachment: " .. tostring(path) end
+    return path, err
+end
+
+local function parent_item(items, item)
+    if type(item.data.parentItem) == "string" and item.data.parentItem ~= "" then
+        return items[item.data.parentItem], true
+    end
+    return nil, false
+end
+
+local function item_label(item)
+    local author = item.meta and item.meta.creatorSummary or "Unknown"
+    return author .. " - " .. (item.data.title or "Untitled")
+end
+
+local function visible_attachment(items, item)
+    if not item.data or item.data.itemType ~= "attachment" or not SUPPORTED_MEDIA_TYPES[item.data.contentType]
+        or item.data.deleted == true or item.data.deleted == 1 then return false end
+    local parent, has_parent = parent_item(items, item)
+    if has_parent and (not parent or parent.data.deleted == true or parent.data.deleted == 1) then return false end
+    return true
+end
+
 function API.displayCollection(key)
-    local result = {}
-
-    -- Get list of collections
-    local collections = API.getCollections()
-    for k, collection in pairs(collections) do
-        if (key == nil and collection.data.parentCollection == false) or
-            (key ~= nil and collection.data.parentCollection == key) then
-            table.insert(result, {
-                ["key"] = k,
-                ["text"] = collection.data.name .. "/",
-                ["collection"] = true
-            })
-        end
-    end
-    -- Sort collections by name
-    local comparator = function(a,b)
-        return (a["text"] < b["text"])
-    end
-    table.sort(result, comparator)
-
-    -- Get list of items
-    -- Careful: linear search. Can be optimized quite a bit!
-    local items = API.getItems()
-    local collectionItems = {}
-
-    for k, item in pairs(items) do
-        if item.data.itemType == "attachment"
-            and table_contains(SUPPORTED_MEDIA_TYPES, item.data.contentType ) then
-
-            if item.data.parentItem ~= nil then
-                -- if we have a parent item, check whether it belongs to the collection
-                -- we search for
-                local parentItem = items[item.data.parentItem]
-                if parentItem ~= nil and table_contains(parentItem.data.collections, key) then
-                    local author = parentItem.meta.creatorSummary or "Unknown"
-                    local name = author .. " - " .. parentItem.data.title
-
-                    table.insert(collectionItems, {
-                        ["key"] = k,
-                        ["text"] = name
-                    })
-                end
-            else
-                -- item does not have metadata header
-                if item.data.collections ~= nil
-                    and table_contains(item.data.collections, key) then
-                    table.insert(collectionItems, {
-                        ["key"] = k,
-                        ["text"] = item.data.title
-                    })
-                end
-            end
-        end
-    end
-    table.sort(collectionItems, comparator)
-
-    -- Join collections and items together and return it
-    return joinTables(result, collectionItems)
-end
-
-function API.displaySearchResults(query)
-    print("displaySearchResults for " .. query)
-    local queryRegex = ".*" .. string.gsub(string.lower(query), " ", ".*") .. ".*"
-    print("Searching for " .. queryRegex)
-    -- Careful: linear search. Can be optimized quite a bit!
-    local items = API.getItems()
     local results = {}
-
-    for k, item in pairs(items) do
-        if item.data.itemType == "attachment"
-            and table_contains(SUPPORTED_MEDIA_TYPES, item.data.contentType ) then
-            if item.data.parentItem ~= nil and items[item.data.parentItem] ~= nil then
-                local parentItem = items[item.data.parentItem]
-                if parentItem ~= nil then
-                    local author = parentItem.meta.creatorSummary or "Unknown"
-                    local name = author .. " - " .. parentItem.data.title
-
-                    if parentItem.data.DOI ~= nil and parentItem.data.DOI ~= "" then
-                        name = name .. " - " .. parentItem.data.DOI
-                    end
-
-                    if string.match(string.lower(name), queryRegex) then
-                        table.insert(results, {
-                            ["key"] = k,
-                            ["text"] = name
-                        })
-                    end
-                end
-            elseif item.data ~= nil and item.data.title ~= nil then
-                -- item does not have metadata header, match against title directly
-                local title = item.data.title
-                if string.match(string.lower(title), queryRegex) then
-                        table.insert(results, {
-                            ["key"] = k,
-                            ["text"] = title
-                        })
-                end
+    for collection_key, collection in pairs(API.getCollections()) do
+        local parent = collection.data.parentCollection
+        if (key == nil and not parent) or parent == key then
+            results[#results + 1] = { key = collection_key, text = collection.data.name .. "/", collection = true }
+        end
+    end
+    local function by_text(a, b) return a.text < b.text end
+    table.sort(results, by_text)
+    local attachments, items = {}, API.getItems()
+    for item_key, item in pairs(items) do
+        if visible_attachment(items, item) then
+            local parent = parent_item(items, item)
+            local source = parent or item
+            if contains(source.data.collections, key) then
+                attachments[#attachments + 1] = { key = item_key, text = parent and item_label(parent) or (item.data.title or item.data.filename) }
             end
         end
     end
-
+    table.sort(attachments, by_text)
+    for _, item in ipairs(attachments) do results[#results + 1] = item end
     return results
 end
 
-
--- Output the timezone-agnostic timestamp, since KOReader uses timestamps with
--- local time.
-function API.addTimezone(timestamp)
-    local year, month, day, hour, minute, second = string.match(timestamp,
-        "(%d%d%d%d)-(%d%d)-(%d%d) (%d%d):(%d%d):(%d%d)")
-    local time = {
-        ["year"] = year,
-        ["month"] = month,
-        ["day"] = day,
-        ["hour"] = hour,
-        ["min"] = minute,
-        ["sec"] = second
-    }
-
-    return os.date("!%Y-%m-%dT%H:%M:%SZ", os.time(time))
-end
-
-function API.localTimezone(timestamp)
-end
-
-function API.compareTimestamps(zoteroTimestamp, koreaderTimestamp)
-    local a,b = zoteroTimestamp, API.addTimezone(koreaderTimestamp)
-
-    if a == b then
-       return 0
-    elseif a < b then
-        return -1
-    else
-        return 1
+function API.displaySearchResults(query)
+    local words = {}
+    for word in trim(query):lower():gmatch("%S+") do words[#words + 1] = word end
+    local results, items = {}, API.getItems()
+    for key, item in pairs(items) do
+        if visible_attachment(items, item) then
+            local parent = parent_item(items, item)
+            local label = parent and item_label(parent) or (item.data.title or item.data.filename)
+            if parent and type(parent.data.DOI) == "string" and parent.data.DOI ~= "" then label = label .. " - " .. parent.data.DOI end
+            local start, matched = 1, true
+            for _, word in ipairs(words) do
+                local first, last = label:lower():find(word, start, true)
+                if not first then matched = false; break end
+                start = last + 1
+            end
+            if matched then results[#results + 1] = { key = key, text = label } end
+        end
     end
-end
-
-function API.syncModifiedItems()
-    local modItems = API.getModifiedItems()
-end
-
-function API.resetSyncState()
-    API.setItems({})
-    API.setCollections({})
-    API.setLibraryVersion(0)
+    table.sort(results, function(a, b) return a.text < b.text end)
+    return results
 end
 
 return API
