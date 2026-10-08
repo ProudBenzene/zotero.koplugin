@@ -15,6 +15,8 @@ local Menu = require("ui/widget/menu")
 local Geom = require("ui/geometry")
 local _ = require("gettext")
 local ZoteroAPI = require("zoteroapi")
+local AttachmentMenu = require("attachmentmenu")
+local TextViewer = require("ui/widget/textviewer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local lfs = require("libs/libkoreader-lfs")
 
@@ -48,7 +50,9 @@ function ZoteroBrowser:init()
 end
 
 function ZoteroBrowser:showView(view)
-    if view.kind == "search" then
+    if view.kind == "attachments" then
+        self:displayAttachments(view.key)
+    elseif view.kind == "search" then
         self:displaySearchResults(view.query)
     else
         self:displayCollection(view.key)
@@ -105,6 +109,8 @@ function ZoteroBrowser:onMenuSelect(item)
         self:navigate({ kind = "search", query = "" })
     elseif item.collection == true then
         self:navigate({ kind = "collection", key = item.key })
+    elseif item.attachment_group == true then
+        self:navigate({ kind = "attachments", key = item.key })
     elseif item.is_label == true then
         -- nop
     else
@@ -134,6 +140,33 @@ function ZoteroBrowser:onMenuSelect(item)
         end)
         UIManager:show(self.download_dialog)
     end
+end
+
+function ZoteroBrowser:onMenuHold(item)
+    if item.collection or item.is_label or item.wildcard_collection then return true end
+    local details
+    details = TextViewer:new{
+        title = AttachmentMenu.text("Attachment details"),
+        text = AttachmentMenu.details(item),
+        show_menu = false,
+        buttons_table = not item.attachment_group and {{ {
+            text = AttachmentMenu.text("Open"),
+            callback = function()
+                UIManager:close(details)
+                self:onMenuSelect(item)
+            end,
+        } }} or nil,
+        add_default_buttons = true,
+    }
+    UIManager:show(details)
+    return true
+end
+
+function ZoteroBrowser:displayAttachments(parent_key)
+    self.current_view = { kind = "attachments", key = parent_key }
+    local items = AttachmentMenu.children(ZoteroAPI.displayAttachments(parent_key))
+    if table_empty(items) then items[1] = { text = _("No Items"), is_label = true } end
+    self:setItems(items, AttachmentMenu.text("Attachments"), true)
 end
 
 function ZoteroBrowser:displaySearchResults(query)
@@ -180,9 +213,9 @@ function ZoteroBrowser:displayCollection(collection_id)
     self:setItems(items, collection and collection.data.name or _("Zotero"))
 end
 
-function ZoteroBrowser:setItems(items, title)
+function ZoteroBrowser:setItems(items, title, attachments_view)
     self.title = title or _("Zotero")
-    self:switchItemTable(self.title, items)
+    self:switchItemTable(self.title, attachments_view and items or AttachmentMenu.group(items))
 end
 
 local Plugin = WidgetContainer:new{

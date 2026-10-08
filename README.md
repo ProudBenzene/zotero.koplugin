@@ -11,6 +11,8 @@ This addon for [KOReader](https://github.com/koreader/koreader) allows you to vi
 * Synchronize a personal library via Zotero Web API v3, including trash and permanent deletions
 * Display collections, navigate to sub-collections
 * Download & open stored PDF and EPUB attachments (`imported_file` and `imported_url`)
+* Show downloaded attachments and outdated local copies directly in the browser
+* Group multiple attachments of one publication, with file names and full details on long-press
 * Supports Zotero File Storage and WebDAV storage with Basic authentication
 * Show download bytes and synchronization stages/counts with e-ink-friendly progress updates
 * Search entries by the title of the publication, name of the first author or DOI.
@@ -71,6 +73,10 @@ Synchronization shows the current stage (account, items, collections, deletions,
 The sync result stays visible until dismissed, even in KOReader's silent mode. Failure messages identify the account check or the failed items/collections page. Successful results report cached library objects, collections and visible PDF/EPUB attachments separately. **Browse** lists collections and PDF/EPUB attachments; ordinary bibliographic records supply attachment labels but are not separate entries. A successful sync can therefore have library objects while **All Items** shows no results. Metadata synchronization uses `api.zotero.org`; WebDAV is only used to download attachments.
 
 The browser starts with top-level collections and an **All Items** shortcut. Opening a collection shows its immediate subcollections and attachments; the title identifies the current collection. **All Items** shows all visible PDF/EPUB attachments and has its own title. Returning restores the previous view, including after a screen resize, and reopening **Browse** starts at the root.
+
+Publications with several visible attachments appear once, with a file count and the number of downloaded files on the right. Tap to choose an attachment by its title, filename and PDF/EPUB format; a publication with one attachment still opens directly. Collections, **All Items** and search results use this grouping. Separate Zotero parent records remain separate even if their titles match. Attachments with identical names have stable numbered entries; long-press shows the complete document title, attachment title, filename, status, local size, file modification time (when available), DOI and attachment key. The details view also has an **Open** button. Naming attachments “Main text”, “Supplementary material” or their version in Zotero makes the choice clearer; the plugin does not infer their role or delete duplicates.
+
+**Downloaded** means the nonempty local file and its cache receipt pass the same checksum/version metadata check used when opening it. **Update available** means a local file exists but cannot be reused for the current attachment metadata. Files with no usable local copy show only their format. Status is checked when rows are rendered, using file attributes and the small cache receipt, without network requests or hashing whole PDFs. Newly downloaded or removed files are reflected when the list is displayed again. The new attachment labels include Simplified Chinese translations for KOReader's Chinese interface.
 
 Metadata requests use KOReader's 10-second socket blocking timeout and file downloads use its 15-second blocking timeout. Neither has a fixed overall duration limit: a large metadata page or a slow PDF/EPUB or WebDAV ZIP can continue while data arrives. Transient metadata timeouts, closed connections, short responses and HTTP 502/504 responses are retried up to three attempts for the same page. Earlier pages are not fetched again for a connection retry, and partial responses are never merged into the snapshot. A file socket timeout reports how many bytes were received; failed partial downloads are removed and existing cached files are preserved.
 

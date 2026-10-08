@@ -149,6 +149,88 @@ describe("Zotero browser offline regressions",function()
         assert(broken.init_error:find("initialization failed",1,true))
     end)
 
+    it("groups siblings while keeping distinct papers with identical titles separate",function()
+        local items={}
+        for _,key in ipairs({"PARENT01","PARENT02"}) do
+            items[key]={key=key,data={itemType="journalArticle",title="Same paper",collections={"COLLECT1"}}}
+        end
+        for index,parent in ipairs({"PARENT01","PARENT01","PARENT02","PARENT02"}) do
+            local key="ATTACH0"..index
+            items[key]=support.attachment(key,"paper.pdf",parent)
+        end
+        support.seed(items,{COLLECT1={key="COLLECT1",data={name="Collection",parentCollection=false}}})
+        browser:displayCollection("COLLECT1")
+        assert(#browser.last_items==2 and browser.last_items[1].attachment_group and browser.last_items[2].attachment_group)
+        assert(browser.last_items[1].key~=browser.last_items[2].key)
+        assert(browser.last_items[1].mandatory_func()=="2 files")
+        browser:onMenuSelect(browser.last_items[1])
+        assert(browser.current_view.kind=="attachments" and #browser.last_items==2 and #support.UI.scheduled==0)
+        assert(browser.last_items[1].text~=browser.last_items[2].text and browser.last_items[1].mandatory_func()=="PDF")
+        local first=browser.last_items[1].key
+        browser:init()
+        assert(browser.current_view.kind=="attachments" and browser.last_items[1].key==first)
+        browser:onReturn()
+        assert(browser.current_view.kind=="collection" and browser.current_view.key=="COLLECT1" and #browser.last_items==2)
+        browser:displaySearchResults("same paper")
+        assert(#browser.last_items==2)
+        browser:onMenuSelect(browser.last_items[1])
+        browser:onReturn()
+        assert(browser.current_view.kind=="search" and browser.current_view.query=="same paper")
+    end)
+
+    it("updates download badges after downloading, metadata changes and local file removal",function()
+        local parent={key="PARENT01",data={itemType="journalArticle",title="Paper"}}
+        support.seed({PARENT01=parent,ATTACH01=support.attachment("ATTACH01","paper.pdf","PARENT01"),
+            ATTACH02=support.attachment("ATTACH02","supplement.pdf","PARENT01")})
+        browser:displaySearchResults("")
+        local group=browser.last_items[1]
+        assert(group.mandatory_func()=="2 files")
+        browser:onMenuSelect(group)
+        local attachment=browser.last_items[1]
+        support.response=function(req) return support.respond(req,"a complete PDF") end
+        browser:onMenuSelect(attachment)
+        support.UI.scheduled[1]()
+        assert(attachment.mandatory_func()=="PDF · Downloaded" and group.mandatory_func()=="2 files · 1 downloaded")
+        API.getItems()[attachment.key].version=11
+        assert(attachment.mandatory_func()=="PDF · Update available" and group.mandatory_func()=="2 files")
+        os.remove(support.opened_path)
+        assert(attachment.mandatory_func()=="PDF")
+    end)
+
+    it("shows full attachment details on hold and opens only after choosing Open",function()
+        local parent={key="PARENT01",data={itemType="journalArticle",title=string.rep("Long paper title ",20),DOI="10.1234/example"}}
+        local attachment=support.attachment("ATTACH01",string.rep("filename",20)..".pdf","PARENT01")
+        attachment.data.title="Supplementary material"
+        support.seed({PARENT01=parent,ATTACH01=attachment,ATTACH02=support.attachment("ATTACH02","main.pdf","PARENT01")})
+        browser:displaySearchResults("")
+        browser:onMenuHold(browser.last_items[1])
+        assert(support.UI.shown[#support.UI.shown].text:find(attachment.data.filename,1,true))
+        browser:onMenuSelect(browser.last_items[1])
+        local selected
+        for _,entry in ipairs(browser.last_items) do if entry.key==attachment.key then selected=entry end end
+        assert(selected.text:find("Supplementary material",1,true) and selected.text:find(attachment.data.filename,1,true))
+        browser:onMenuHold(selected)
+        local viewer=support.UI.shown[#support.UI.shown]
+        assert(viewer.text:find(parent.data.title,1,true) and viewer.text:find(attachment.data.filename,1,true))
+        assert(viewer.text:find("Not downloaded",1,true) and viewer.text:find("10.1234/example",1,true))
+        assert(viewer.text:find("Zotero key: ATTACH01",1,true) and #support.UI.scheduled==0)
+        viewer.buttons_table[1][1].callback()
+        assert(support.UI.closed[#support.UI.closed]==viewer and #support.UI.scheduled==1)
+    end)
+
+    it("shows Chinese download and attachment labels in a Chinese KOReader interface",function()
+        support.GetText.current_lang="zh_CN"
+        local directory,path=API.getDirAndPath("ATTACH01")
+        assert(support.makePath(directory))
+        support.write(path,"PDF")
+        support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=10}))
+        browser:displaySearchResults("")
+        assert(browser.last_items[1].mandatory_func()=="PDF · 已下载")
+        browser:onMenuHold(browser.last_items[1])
+        local viewer=support.UI.shown[#support.UI.shown]
+        assert(viewer.title=="附件信息" and viewer.text:find("状态：已下载",1,true))
+    end)
+
     it("closes the download message on failure and prevents duplicate queued downloads",function()
         API.downloadAndGetPath=function() return nil,"download failed" end
         browser:onMenuSelect({key="ATTACH01"})

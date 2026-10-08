@@ -201,6 +201,7 @@ local UI = {
     yieldToEPDC=function() end,
 }
 Support.UI=UI
+Support.GetText=setmetatable({current_lang="C"}, {__call=function(_, value) return value end})
 local modules = {
     ["ffi/util"]={joinPath=function(a,b) return a.."/"..b end, usleep=function() end},
     ["luasettings"]={open=function() return settings end},
@@ -219,7 +220,8 @@ local modules = {
     ["ui/widget/container/framecontainer"]=Widget, ["device"]={screen={getWidth=function() return 600 end,
         getHeight=function() return 800 end,scaleBySize=function(_, value) return value end}},
     ["ui/font"]={getFace=function() return {} end}, ["ui/widget/menu"]=Menu,
-    ["ui/geometry"]=Widget, ["gettext"]=function(value) return value end,
+    ["ui/geometry"]=Widget, ["gettext"]=Support.GetText,
+    ["ui/widget/textviewer"]=Widget,
     ["ui/widget/multiinputdialog"]=Widget,
     ["apps/reader/readerui"]={showReader=function(_, path) Support.opened_path=path end},
 }
@@ -234,11 +236,13 @@ function Support.setup()
     Support.response=function(req) error("Unexpected HTTP request: " .. req.url) end
     UI.shown, UI.closed, UI.scheduled = {}, {}, {}
     UI.dirty, UI.paints, Support.clock = {}, {}, 0
+    Support.GetText.current_lang="C"
     local temporary_root=os.getenv("TMPDIR") or "/tmp"
     Support.directory=temporary_root.."/zotero-tests-"..tostring(original_time()).."-"..tostring({}):gsub("[^%w]","")
     assert(Support.makePath(Support.directory))
     package.loaded.zoteroapi=nil
     package.loaded.progressdialog=nil
+    package.loaded.attachmentmenu=nil
     local api=require("zoteroapi")
     api.init(Support.directory)
     Support.API=api

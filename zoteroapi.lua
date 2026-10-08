@@ -809,6 +809,28 @@ local function attachment_md5(attachment)
     if type(digest) == "string" and #digest == 32 and digest:match("^%x+$") then return digest:lower() end
 end
 
+-- Use the same cache decision for browsing and opening. This only reads the
+-- small receipt and file attributes; browsing must not hash PDFs or use HTTP.
+local function attachment_status(attachment, directory, path)
+    local attributes = path and lfs.attributes(path)
+    if not attributes or attributes.mode ~= "file" or attributes.size == 0 then
+        return "not_downloaded"
+    end
+    local metadata = read_json(directory .. "/.zotero-cache.json")
+    local md5, version = attachment_md5(attachment), tonumber(attachment.version)
+    if metadata and ((md5 and metadata.md5 == md5)
+        or (not md5 and version and tonumber(metadata.version) == version)) then
+        return "downloaded", path, attributes.size
+    end
+    return "outdated", path, attributes.size
+end
+
+function API.getAttachmentStatus(key)
+    local directory, path = API.getDirAndPath(key)
+    if not path then return "not_downloaded" end
+    return attachment_status(API.getItems()[key], directory, path)
+end
+
 local function file_md5(path, progress_callback)
     local f, err = io.open(path, "rb")
     if not f then return nil, err end
@@ -843,12 +865,8 @@ local function download_attachment(key, download_callback, progress_callback)
     ok, err = util.makePath(target_dir)
     if not ok then return nil, "Could not create attachment directory: " .. tostring(err) end
     local metadata_path = target_dir .. "/.zotero-cache.json"
-    local metadata = read_json(metadata_path)
     local md5 = attachment_md5(attachment)
-    local cached_attributes = lfs.attributes(target_path)
-    local version = tonumber(attachment.version)
-    if metadata and cached_attributes and cached_attributes.mode == "file" and cached_attributes.size > 0
-        and ((md5 and metadata.md5 == md5) or (not md5 and version and tonumber(metadata.version) == version)) then
+    if attachment_status(attachment, target_dir, target_path) == "downloaded" then
         report_progress(progress_callback, "cached")
         return target_path
     end
@@ -931,6 +949,35 @@ local function visible_attachment(items, item)
     return true
 end
 
+local function attachment_entry(key, item, parent, label)
+    return { key = key, text = label, parent_key = parent and item.data.parentItem,
+        attachment_title = item.data.title, filename = item.data.filename,
+        file_type = item.data.contentType == "application/pdf" and "PDF" or "EPUB" }
+end
+
+local function by_text(a, b)
+    if a.text ~= b.text then return a.text < b.text end
+    return a.key < b.key
+end
+
+function API.displayAttachments(parent_key)
+    local results, items = {}, API.getItems()
+    local parent = items[parent_key]
+    if not parent then return results end
+    for key, item in pairs(items) do
+        if visible_attachment(items, item) and item.data.parentItem == parent_key then
+            results[#results + 1] = attachment_entry(key, item, parent, item_label(parent))
+        end
+    end
+    table.sort(results, function(a, b)
+        local a_name, b_name = a.attachment_title or a.filename or "", b.attachment_title or b.filename or ""
+        if a_name ~= b_name then return a_name < b_name end
+        if a.filename ~= b.filename then return (a.filename or "") < (b.filename or "") end
+        return a.key < b.key
+    end)
+    return results
+end
+
 function API.getLibrarySummary()
     local items, collections = API.getItems(), API.getCollections()
     local summary = { items = 0, collections = 0, attachments = 0 }
@@ -950,7 +997,6 @@ function API.displayCollection(key)
             results[#results + 1] = { key = collection_key, text = collection.data.name .. "/", collection = true }
         end
     end
-    local function by_text(a, b) return a.text < b.text end
     table.sort(results, by_text)
     local attachments, items = {}, API.getItems()
     for item_key, item in pairs(items) do
@@ -958,7 +1004,8 @@ function API.displayCollection(key)
             local parent = parent_item(items, item)
             local source = parent or item
             if contains(source.data.collections, key) then
-                attachments[#attachments + 1] = { key = item_key, text = parent and item_label(parent) or (item.data.title or item.data.filename) }
+                attachments[#attachments + 1] = attachment_entry(item_key, item, parent,
+                    parent and item_label(parent) or (item.data.title or item.data.filename or "Untitled"))
             end
         end
     end
@@ -974,7 +1021,7 @@ function API.displaySearchResults(query)
     for key, item in pairs(items) do
         if visible_attachment(items, item) then
             local parent = parent_item(items, item)
-            local label = parent and item_label(parent) or (item.data.title or item.data.filename)
+            local label = parent and item_label(parent) or (item.data.title or item.data.filename or "Untitled")
             if parent and type(parent.data.DOI) == "string" and parent.data.DOI ~= "" then label = label .. " - " .. parent.data.DOI end
             local start, matched = 1, true
             for _, word in ipairs(words) do
@@ -982,10 +1029,10 @@ function API.displaySearchResults(query)
                 if not first then matched = false; break end
                 start = last + 1
             end
-            if matched then results[#results + 1] = { key = key, text = label } end
+            if matched then results[#results + 1] = attachment_entry(key, item, parent, label) end
         end
     end
-    table.sort(results, function(a, b) return a.text < b.text end)
+    table.sort(results, by_text)
     return results
 end
 
