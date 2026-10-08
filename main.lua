@@ -1,6 +1,7 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Dispatcher = require("dispatcher")  -- luacheck:ignore
 local InfoMessage = require("ui/widget/infomessage")
+local ProgressDialog = require("progressdialog")
 local InputDialog = require("ui/widget/inputdialog")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -38,9 +39,12 @@ local ZoteroBrowser = Menu:extend{
 
 
 function ZoteroBrowser:init()
+    -- Menu:init also runs when rebuilding the layout after a screen resize.
+    local paths, current_view = self.paths, self.current_view
     Menu.init(self)
-    self.paths = {}
-    self.current_view = { kind = "collection" }
+    self.paths = paths or {}
+    self.current_view = current_view or { kind = "collection" }
+    if self.page_return_arrow then self.page_return_arrow:enableDisable(#self.paths > 0) end
 end
 
 function ZoteroBrowser:showView(view)
@@ -97,27 +101,28 @@ end
 
 
 function ZoteroBrowser:onMenuSelect(item)
-    if item.collection ~= nil then
-        self:navigate({ kind = "collection", key = item.key })
-    elseif item.wildcard_collection ~= nil then
+    if item.wildcard_collection == true then
         self:navigate({ kind = "search", query = "" })
-    elseif item.is_label ~= nil then
+    elseif item.collection == true then
+        self:navigate({ kind = "collection", key = item.key })
+    elseif item.is_label == true then
         -- nop
     else
         if self.downloading then return true end
         self.downloading = true
-        self.download_dialog = InfoMessage:new{
-            text = _("Downloading file"),
-            icon = "notice-info",
-        }
+        self.download_dialog = ProgressDialog:new{ operation = "download" }
         UIManager:scheduleIn(0.05, function()
-            local full_path, e = ZoteroAPI.downloadAndGetPath(item.key)
+            local ok, full_path, e = pcall(ZoteroAPI.downloadAndGetPath, item.key, nil, function(event)
+                self.download_dialog:update(event)
+            end)
+            if not ok then e, full_path = tostring(full_path), nil end
             self.downloading = false
             UIManager:close(self.download_dialog)
             if e ~= nil then
                 local b = InfoMessage:new{
                     text = _("Could not open file.") .. "\n" .. e,
-                    timeout = 5,
+                    honor_silent_mode = false,
+                    flush_events_on_show = true,
                     icon = "notice-warning"
                 }
                 UIManager:show(b)
@@ -144,12 +149,15 @@ function ZoteroBrowser:displaySearchResults(query)
             ["is_label"] = true,
         })
     end
-    self:setItems(items)
+    self:setItems(items, query == "" and _("All Items") or _("Search results"))
 end
 
 function ZoteroBrowser:displayCollection(collection_id)
     self.current_view = { kind = "collection", key = collection_id }
-    local ok, items = pcall(ZoteroAPI.displayCollection, collection_id)
+    local ok, items, collection = pcall(function()
+        return ZoteroAPI.displayCollection(collection_id),
+            collection_id and ZoteroAPI.getCollections()[collection_id]
+    end)
     if not ok then
         UIManager:show(InfoMessage:new{ text = tostring(items), icon = "notice-warning" })
         items = {}
@@ -169,11 +177,12 @@ function ZoteroBrowser:displayCollection(collection_id)
         })
     end
 
-    self:setItems(items)
+    self:setItems(items, collection and collection.data.name or _("Zotero"))
 end
 
-function ZoteroBrowser:setItems(items)
-    self:switchItemTable("Zotero", items)
+function ZoteroBrowser:setItems(items, title)
+    self.title = title or _("Zotero")
+    self:switchItemTable(self.title, items)
 end
 
 local Plugin = WidgetContainer:new{
@@ -225,7 +234,7 @@ end
 function Plugin:initAPIAndBrowser()
     self.zotero_dir_path = DataStorage:getDataDir() .. "/zotero"
     lfs.mkdir(self.zotero_dir_path)
-    ZoteroAPI.init(self.zotero_dir_path)
+    ZoteroAPI.init(self.zotero_dir_path, true)
     self.small_font_face = Font:getFace("smallffont")
     self.browser = ZoteroBrowser:new{
         refresh_callback = function()
@@ -469,16 +478,31 @@ function Plugin:getItemsPerPage()
 end
 
 function Plugin:onZoteroOpenAction()
-    if not self:checkInitialized() then
-        return
+    if not self:checkInitialized() or self.browsing then return end
+    self.browsing = true
+    local loading
+    local function open()
+        local ok, err = pcall(function()
+            self.browser.paths = {}
+            self.browser.current_view = { kind = "collection" }
+            self.browser:displayCollection(nil)
+        end)
+        self.browsing = false
+        if loading then UIManager:close(loading) end
+        if not ok then
+            UIManager:show(InfoMessage:new{ text = _("Could not load Zotero library.") .. "\n" .. tostring(err),
+                honor_silent_mode = false, flush_events_on_show = true, icon = "notice-warning" })
+            return
+        end
+        UIManager:show(self.zotero_dialog, "full", Geom:new{ w = Screen:getWidth(), h = Screen:getHeight() })
     end
-
-    self.browser:init()
-    UIManager:show(self.zotero_dialog, "full", Geom:new{
-        w = Screen:getWidth(),
-        h = Screen:getHeight()
-    })
-    self.browser:displayCollection(nil)
+    if ZoteroAPI.isLibraryLoaded() then open()
+    else
+        loading = InfoMessage:new{ text = _("Loading Zotero library…"), honor_silent_mode = false,
+            dismissable = false, unmovable = true }
+        UIManager:show(loading)
+        UIManager:scheduleIn(0.05, open)
+    end
 end
 
 function Plugin:onZoteroSyncAction()
@@ -487,25 +511,31 @@ function Plugin:onZoteroSyncAction()
     end
     if self.syncing then return end
     self.syncing = true
-    local message = InfoMessage:new{
-        text = _("Synchronizing Zotero library. This might take some time."),
-        icon = "notice-info",
-    }
+    local message = ProgressDialog:new{ operation = "sync" }
     UIManager:scheduleIn(1, function()
-        local e = ZoteroAPI.syncAllItems()
+        local ok, e, summary = pcall(function()
+            local err = ZoteroAPI.syncAllItems(function(event) message:update(event) end)
+            if err then return err end
+            return nil, ZoteroAPI.getLibrarySummary()
+        end)
+        if not ok then e = tostring(e) end
         self.syncing = false
         UIManager:close(message)
 
         if e == nil then
             UIManager:show(InfoMessage:new{
-                text = _("Success."),
-                timeout = 3,
+                text = _("Synchronization complete.") .. "\n" ..
+                    (_("Library items: %d\nCollections: %d\nVisible PDF/EPUB attachments: %d")):format(
+                        summary.items, summary.collections, summary.attachments),
+                honor_silent_mode = false,
+                flush_events_on_show = true,
                 icon = "check"
             })
         else
             UIManager:show(InfoMessage:new{
-                text = e,
-                timeout = 3,
+                text = _("Synchronization failed.") .. "\n" .. e,
+                honor_silent_mode = false,
+                flush_events_on_show = true,
                 icon = "notice-warning"
             })
         end

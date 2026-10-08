@@ -153,11 +153,52 @@ function Widget:getInputText() return self.input end
 function Widget:getFields() return self.test_fields end
 function Widget:switchItemTable(_, items) self.last_items=items end
 function Widget:init() end
+function Widget:free() end
+local Menu = Widget:extend{}
+function Menu:init()
+    -- KOReader rebuilds this navigation field on layout initialization.
+    self.paths = {}
+    self.item_table = self.item_table or {}
+    self.item_table_stack = {}
+    self.page = 1
+    self.page_return_arrow = { enableDisable = function(arrow, enabled) arrow.enabled = enabled end }
+    self.page_return_arrow:enableDisable(#self.paths > 0)
+end
+function Menu:switchItemTable(title, items)
+    self.title, self.item_table, self.last_items = title, items, items
+    self.page = 1
+    self.page_return_arrow:enableDisable(#self.paths > 0)
+end
+local InfoMessage = Widget:extend{ text = "" }
+function InfoMessage:init()
+    local width, height = self.width or 400, self.height or 80
+    self.movable = { dimen = { x = (600-width)/2, y = (800-height)/2, w = width, h = height } }
+end
+function InfoMessage:getVisibleArea() return self.movable.dimen end
+function InfoMessage:onShow() end
+function InfoMessage:onCloseWidget() end
 local UI = {
-    shown={}, closed={}, scheduled={},
-    show=function(self, widget) self.shown[#self.shown+1] = widget end,
-    close=function(self, widget) self.closed[#self.closed+1] = widget end,
+    shown={}, closed={}, scheduled={}, dirty={}, paints={},
+    show=function(self, widget)
+        self.shown[#self.shown+1] = widget
+        if widget.onShow then widget:onShow() end
+    end,
+    close=function(self, widget)
+        self.closed[#self.closed+1] = widget
+        if widget.onCloseWidget then widget:onCloseWidget() end
+        self.dirty[widget] = nil
+    end,
     scheduleIn=function(self, _, callback) self.scheduled[#self.scheduled+1] = callback end,
+    setDirty=function(self, widget, mode, region) self.dirty[widget] = { mode = mode, region = region } end,
+    forceRePaint=function(self)
+        for widget, refresh in pairs(self.dirty) do
+            local mode, region = refresh.mode, refresh.region
+            if type(mode) == "function" then mode, region = mode() end
+            self.paints[#self.paints+1] = { text = widget.text, time = Support.clock, mode = mode, region = region }
+        end
+        self.dirty = {}
+    end,
+    yieldToEPDC=function() end,
 }
 Support.UI=UI
 local modules = {
@@ -171,11 +212,13 @@ local modules = {
         source={string=function(value) return function() local chunk=value;value=nil;return chunk end end},
     },
     ["ffi/blitbuffer"]={COLOR_WHITE=0}, ["dispatcher"]={registerAction=function() end},
-    ["ui/widget/infomessage"]=Widget, ["ui/widget/inputdialog"]=Widget, ["ui/uimanager"]=UI,
+    ["ui/widget/infomessage"]=InfoMessage, ["ui/widget/inputdialog"]=Widget, ["ui/uimanager"]=UI,
+    ["ui/time"]={now=function() return Support.clock*1000000 end, s=function(seconds) return seconds*1000000 end},
     ["ui/widget/container/widgetcontainer"]=Widget, ["ui/widget/spinwidget"]=Widget,
     ["datastorage"]={getDataDir=function() return Support.directory end},
-    ["ui/widget/container/framecontainer"]=Widget, ["device"]={screen={getWidth=function() return 600 end,getHeight=function() return 800 end}},
-    ["ui/font"]={getFace=function() return {} end}, ["ui/widget/menu"]=Widget,
+    ["ui/widget/container/framecontainer"]=Widget, ["device"]={screen={getWidth=function() return 600 end,
+        getHeight=function() return 800 end,scaleBySize=function(_, value) return value end}},
+    ["ui/font"]={getFace=function() return {} end}, ["ui/widget/menu"]=Menu,
     ["ui/geometry"]=Widget, ["gettext"]=function(value) return value end,
     ["ui/widget/multiinputdialog"]=Widget,
     ["apps/reader/readerui"]={showReader=function(_, path) Support.opened_path=path end},
@@ -190,10 +233,12 @@ function Support.setup()
     Support.opened_path, Support.last_touch = nil,nil
     Support.response=function(req) error("Unexpected HTTP request: " .. req.url) end
     UI.shown, UI.closed, UI.scheduled = {}, {}, {}
+    UI.dirty, UI.paints, Support.clock = {}, {}, 0
     local temporary_root=os.getenv("TMPDIR") or "/tmp"
     Support.directory=temporary_root.."/zotero-tests-"..tostring(original_time()).."-"..tostring({}):gsub("[^%w]","")
     assert(Support.makePath(Support.directory))
     package.loaded.zoteroapi=nil
+    package.loaded.progressdialog=nil
     local api=require("zoteroapi")
     api.init(Support.directory)
     Support.API=api

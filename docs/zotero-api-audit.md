@@ -1,6 +1,6 @@
 # Zotero 协议核对与修复记录
 
-首次核对日期：**2026-10-07**；下载时间单位与压缩文件 hash 补核日期：**2026-10-08**。审查基线：插件 commit `73caca82e5d084367181c9347249664121158abe`。以下记录协议、原实现及本轮已实施的调整；Lua 5.1 和 Lua 5.4 的 **46 项离线回归均全部通过**。
+首次核对日期：**2026-10-07**；下载时间单位、压缩文件 hash 与 Kindle 稳定性补核日期：**2026-10-08**。审查基线：插件 commit `73caca82e5d084367181c9347249664121158abe`。以下记录协议、原实现及后续调整；首次修复的 46 项离线回归全部通过，当前 Lua 5.1 和 Lua 5.4 均为 **87/87 项通过**。
 
 官方 Web API 的 [basics](https://www.zotero.org/support/dev/web_api/v3/basics) 与 [file_upload](https://www.zotero.org/support/dev/web_api/v3/file_upload) 页面最近更新时间为 2026-07-29；[syncing](https://www.zotero.org/support/dev/web_api/v3/syncing) 页面为 2022-08-14。文档较旧的下载细节另外核对了官方源码：
 
@@ -50,4 +50,30 @@ API v3 并未过时，当前问题主要来自旧插件实现。此次保留个�
 
 搜索、返回导航、初始化失败及失效测试属于插件内部问题，随本次修复处理。46 项离线回归在 Lua 5.1 和 Lua 5.4 下均通过，覆盖同步一致性与删除、下载失败保留缓存、跳转与压缩归档、附件格式以及界面导航等。
 
-常规测试使用 KOReader、HTTP、JSON 与摘要计算的 test doubles，并执行真实临时文件读写及 `unzip`。另在 Lua 5.1 中换用官方 [KOReader sha2 模块](https://github.com/koreader/koreader-base/blob/master/ffi/sha2.lua) 和 [LuaSocket URL 模块](https://github.com/lunarmodules/luasocket/blob/master/src/url.lua) 重跑这 46 项测试，全部通过，确认增量摘要、Base64 和 URL 接口兼容。外部 JSON 库与真实网络栈未做集成验证；KOReader 真机、真实 Zotero 云端与用户 WebDAV 服务的联调尚未执行。
+常规测试使用 KOReader、HTTP、JSON 与摘要计算的 test doubles，并执行真实临时文件读写及 `unzip`。另在 Lua 5.1 中换用官方 [KOReader sha2 模块](https://github.com/koreader/koreader-base/blob/master/ffi/sha2.lua) 和 [LuaSocket URL 模块](https://github.com/lunarmodules/luasocket/blob/master/src/url.lua) 重跑首次修复的 46 项测试，全部通过，确认增量摘要、Base64 和 URL 接口兼容。首次提交时尚未执行真实服务联调；后续验证见下文。
+
+## 2026-10-08：WebDAV 下载截断补核
+
+对一次解包失败的附件进行了只读联调。服务器声明 ZIP 长度为 15,870,667 字节，多次普通 GET 提前结束，实际收到的字节数小于声明值。取回完整归档后，文件名匹配现有实现，ZIP CRC 校验通过；主 PDF 为 17,233,664 字节，MD5 与 Zotero 附件元数据一致，PDF 工具可以解析出 34 页，未加密。没有发现这份远端 PDF 或 ZIP 本身损坏。设备失败时的临时 ZIP 已被清理，因此无法直接核对截图对应的那一次下载。
+
+下载实现新增响应长度检查。短响应提供强 ETag 时，使用 `Range` / `If-Range` 最多续传三次；只有返回的范围、总长度和 ETag 均吻合才追加数据。服务器返回完整的 200 响应时替换临时副本；不把它追加到已有片段。续传条件依据 [HTTP RFC 9110 §13.1.5](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.5)。失败删除片段并保留已验证的缓存。
+
+修改后的插件下载逻辑通过真实 WebDAV 验证：首次收到 15,564,800 字节，随后两次续传分别收到 278,528 和 27,339 字节，最终解包及主文件 MD5 校验成功。此次联调通过 Python HTTP 适配器驱动 Lua 插件逻辑，缓存只写临时目录；并未运行 Kindle ARM 上的 LuaSocket/TLS 栈或 PDF 阅读器。目标设备仍需安装新版后复测。
+
+当前 Lua 5.1 与 Lua 5.4 下均为 **76/76 项离线回归通过**，新增覆盖短响应、续传范围/ETag 不一致、服务器忽略范围、重试上限，以及压缩 Zotero Storage 响应头的保留。
+
+## 2026-10-08：大库加载、分页超时与设备日志
+
+只读检查 Kindle Oasis 3 上的插件及缓存，设备日志报告 KOReader v2026.03。现有 `library.json` 为 28,215,548 字节，包含 7,176 个对象、42 个集合、737 个可浏览 PDF/EPUB 附件。笔记 HTML 和批注正文占据了大部分空间，浏览与下载并不需要这些内容。此前加载完整 JSON、保留全部字段，以及阅读器初始化时重置已加载状态，都会增加设备的等待与内存占用。
+
+新增 `librarycache.lua`，大于 2 MiB 的旧快照按 64 KiB 分块、逐对象解码与投影，避免同时保留完整输入和全部正文。较小快照继续使用现有 JSON 解码器。投影只影响插件本地快照，保留所有对象 key、版本、集合层级、显示与校验所需字段；同步收到的对象也立即投影。首次迁移原设备快照后，文件为 **1,275,505 字节**，上述数量保持不变。已加载快照在相同账号的阅读器初始化之间复用，冷启动 Browse 先显示加载提示。
+
+截图中的分页 `sink timeout` 与原有元数据请求的 30 秒总时限相符：即使数据持续到达，该时限也会结束响应。现移除元数据与文件请求的固定总时限，保留 KOReader 的 10 秒元数据、15 秒文件 socket blocking timeout。连接临时超时、提前关闭、响应长度不足和 HTTP 502/504 最多尝试三次，只重试当前页；响应完整后才解析和合并。429/503 仍按 Zotero 的退避规则处理，不立即重复请求。[KOReader socketutil](https://github.com/koreader/koreader/blob/master/frontend/socketutil.lua)、[Zotero rate limiting](https://www.zotero.org/support/dev/web_api/v3/basics#rate_limiting)
+
+用真实云端库执行一次强制全量同步，条目分页完成到第 73 页，随后集合请求完成，结果为 **7,176 个对象、42 个集合、737 个可浏览附件**，新快照为 1,275,506 字节；耗时 **402.2 秒**，本轮没有触发连接重试。该检查通过 Python HTTP/JSON 适配器运行 Lua 5.1 插件逻辑，只写临时目录，没有修改设备缓存、云端条目或配置；它不验证 Kindle ARM 的 LuaSocket/TLS、输入与屏幕实现。
+
+首次 WebDAV 解包失败、第二次成功，仍不足以证明那一次失败的具体原因：旧版已删除失败的 ZIP，通用错误也未保存 `unzip` 输出。现捕获具体解包诊断和退出状态；识别到下载归档损坏时自动重新下载一次，同时保留一份失败归档及 `download-error.log`，包括附件 key、归档大小与诊断。即使重试成功也保留，便于核对偶发问题；缺少指定文件或解压命令不兼容不自动重试。凭据及认证请求头不写入诊断文件。
+
+附带的 Kindle TXT/TGZ 报告属于 `KPPMainAppV2`、`cvm` 等原生进程，其中可见 `SIGABRT`、`could not open the kpp_daemon_fm file` 和系统低内存事件。KOReader `crash.log` 中另有内存警告及大量 input `Broken pipe`，未找到能归因到插件的 Lua traceback。缓存精简能减少插件内存负担，但这些记录不能证明所有原生崩溃均由插件引起，或已被这次修改全部解决。归档只在内存中读取，未执行其中内容。
+
+当前 **87/87** 项回归在 Lua 5.1 与 Lua 5.4 下通过，新增覆盖持续接收超过旧时限、同页有限重试与旧快照保护、缓存精简与账号失效、分块读取边界、冷启动加载提示，以及损坏 WebDAV ZIP 重试后仍保留主文件诊断。
