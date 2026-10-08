@@ -23,5 +23,7 @@ end
 dofile("zoteroapi.spec.lua")
 dofile("tests/librarycache.spec.lua")
 dofile("tests/main.spec.lua")
+dofile("tests/annotations.spec.lua")
+dofile("tests/localfiles.spec.lua")
 io.write(("\n%d/%d tests passed\n"):format(total-failed,total))
 assert(failed==0, "Regression tests failed")

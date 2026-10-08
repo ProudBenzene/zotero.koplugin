@@ -3,6 +3,7 @@ local Support = { requests = {}, settings_data = {}, logs = {}, digests = {} }
 local original_execute = os.execute
 local original_print = print
 local original_rename = os.rename
+local original_remove = os.remove
 local original_open = io.open
 local original_time = os.time
 local json_values, json_counter = {}, 0
@@ -38,7 +39,8 @@ end
 Support.JSON = {
     encode = function(value)
         json_counter = json_counter + 1
-        local token = '"test-json-' .. json_counter .. '"'
+        local token = (value[1] ~= nil or next(value) == nil)
+            and '["test-json-' .. json_counter .. '"]' or '{"test-json-' .. json_counter .. '":true}'
         json_values[token] = clone(value)
         return token
     end,
@@ -203,7 +205,8 @@ local UI = {
 Support.UI=UI
 Support.GetText=setmetatable({current_lang="C"}, {__call=function(_, value) return value end})
 local modules = {
-    ["ffi/util"]={joinPath=function(a,b) return a.."/"..b end, usleep=function() end},
+    ["ffi/util"]={joinPath=function(a,b) return a.."/"..b end, usleep=function() end,
+        realpath=function(path) return Support.real_paths[path] or path end},
     ["luasettings"]={open=function() return settings end},
     ["socket.http"]=Support.http, ["socket.url"]=URL, ["socketutil"]=socketutil,
     ["json"]=Support.JSON, ["libs/libkoreader-lfs"]=lfs, ["ffi/sha2"]=sha2,
@@ -212,7 +215,9 @@ local modules = {
         sink={table=function(values) return function(chunk) if chunk then values[#values+1]=chunk end;return 1 end end},
         source={string=function(value) return function() local chunk=value;value=nil;return chunk end end},
     },
-    ["ffi/blitbuffer"]={COLOR_WHITE=0}, ["dispatcher"]={registerAction=function() end},
+    ["ffi/blitbuffer"]={COLOR_WHITE=0,COLOR_BLACK=15,isColor8=function(color) return type(color)=="number" end},
+    ["dispatcher"]={registerAction=function() end},
+    ["logger"]={info=function(...) print(...) end,warn=function(...) print(...) end,dbg=function() end},
     ["ui/widget/infomessage"]=InfoMessage, ["ui/widget/inputdialog"]=Widget, ["ui/uimanager"]=UI,
     ["ui/time"]={now=function() return Support.clock*1000000 end, s=function(seconds) return seconds*1000000 end},
     ["ui/widget/container/widgetcontainer"]=Widget, ["ui/widget/spinwidget"]=Widget,
@@ -222,8 +227,27 @@ local modules = {
     ["ui/font"]={getFace=function() return {} end}, ["ui/widget/menu"]=Menu,
     ["ui/geometry"]=Widget, ["gettext"]=Support.GetText,
     ["ui/widget/textviewer"]=Widget,
+    ["ui/widget/confirmbox"]=Widget,
     ["ui/widget/multiinputdialog"]=Widget,
     ["apps/reader/readerui"]={showReader=function(_, path) Support.opened_path=path end},
+    ["docsettings"]={open=function(_, path)
+        Support.settings_opened_path=path
+        local data=Support.doc_settings[path] or {}
+        local instance={data=data.data or {},candidates=data.candidates,
+            readSetting=function(self, key) return self.data[key] end,
+            getCustomCoverFile=function() return data.cover end,
+            getCustomMetadataFile=function() return data.metadata end,
+            purge=function(self)
+                Support.purged_path=path
+                for _,candidate in ipairs(self.candidates or {}) do os.remove(candidate.path) end
+                if data.cover then os.remove(data.cover) end
+                if data.metadata then os.remove(data.metadata) end
+            end}
+        return instance
+    end},
+    ["ui/widget/booklist"]={resetBookInfoCache=function(path) Support.book_cache_reset=path end},
+    ["readhistory"]={fileDeleted=function(_,path) Support.history_deleted=path end},
+    ["readcollection"]={removeItem=function(_,path) Support.collection_removed=path end},
 }
 for name, module in pairs(modules) do
     local value = module
@@ -232,6 +256,11 @@ end
 
 function Support.setup()
     Support.requests, Support.logs, Support.settings_data = {}, {}, {api_key="FAKE-KEY",user_id="123"}
+    Support.real_paths = {}
+    Support.doc_settings = {}
+    Support.settings_opened_path, Support.purged_path = nil,nil
+    Support.book_cache_reset, Support.history_deleted, Support.collection_removed = nil,nil,nil
+    modules["apps/reader/readerui"].instance=nil
     Support.opened_path, Support.last_touch = nil,nil
     Support.response=function(req) error("Unexpected HTTP request: " .. req.url) end
     UI.shown, UI.closed, UI.scheduled = {}, {}, {}
@@ -254,7 +283,7 @@ function Support.setup()
     return api
 end
 function Support.teardown()
-    os.execute, os.rename, io.open, print = original_execute,original_rename,original_open,original_print
+    os.execute, os.rename, os.remove, io.open, print = original_execute,original_rename,original_remove,original_open,original_print
     os.time=original_time
     if Support.directory then
         assert(Support.execute("rm -rf " .. Support.quote(Support.directory)))

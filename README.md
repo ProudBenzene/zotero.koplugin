@@ -7,6 +7,17 @@ This addon for [KOReader](https://github.com/koreader/koreader) allows you to vi
 
 <div align="center"><img width="600" alt="Screenshot of this plugin displaying a list of papers alongside a search button" src="https://raw.githubusercontent.com/stelzch/screencasts/main/zotero-koplugin-screenshot.png"></div>
 
+## 此 fork 的主要更新
+
+基于 [源仓库](https://github.com/stelzch/zotero.koplugin)，主要更新：
+
+- **单向 PDF 批注同步**：导入 Zotero 云端高亮、下划线、区域批注及颜色、文字、评论，支持云端修改与删除；点按区域可查看评论。
+- **手动更新与离线查看**：Synchronize / Resync 更新已下载 PDF 的批注；Browse 长按附件可单独更新。重开后应用，最近阅读和文件管理器也能离线显示缓存。
+- **释放本机空间**：Browse 长按 PDF → 删除本地文件，清理 PDF、批注、书签和阅读进度；云端保留，可重新下载。
+- **保留本地数据**：独立批注缓存，保留本地批注、书签和阅读进度；不上传批注，不改写 PDF。
+- **同步与下载修复**：库版本一致性、增量删除、Zotero Storage / WebDAV 文件校验、网络重试与截断续传；失败保留旧缓存。
+- **浏览与性能优化**：同文献多附件分组、下载状态与长按详情、精简大库缓存，以及适合电子墨水屏的同步和下载进度。
+
 ## Features
 * Synchronize a personal library via Zotero Web API v3, including trash and permanent deletions
 * Display collections, navigate to sub-collections
@@ -15,6 +26,7 @@ This addon for [KOReader](https://github.com/koreader/koreader) allows you to vi
 * Group multiple attachments of one publication, with file names and full details on long-press
 * Supports Zotero File Storage and WebDAV storage with Basic authentication
 * Show download bytes and synchronization stages/counts with e-ink-friendly progress updates
+* View Zotero PDF highlights, underlines and area annotations offline
 * Search entries by the title of the publication, name of the first author or DOI.
 ## Installation Guide
 1. Copy the files in this repository to `<KOReader>/plugins/zotero.koplugin`
@@ -64,6 +76,16 @@ Changing the user ID or API key invalidates the current metadata snapshot and st
 
 The local metadata cache keeps the fields used for browsing, searching and downloading. Note HTML, annotation text, abstracts and unused API links are discarded locally; object keys, versions, collection parents and attachment checksums remain available. Zotero itself is unchanged. Existing large snapshots are converted one record at a time on their first load, and already loaded metadata is reused across reader initialization. A cold **Browse** displays a loading message before reading the cache.
 
+### One-way PDF annotation sync
+
+**Synchronize** and **Resync entire collection** update annotations for downloaded PDFs only. For one PDF, use **Browse → long-press attachment → Refresh annotations**. **Maintenance → Refetch downloaded PDF annotations** forces a refresh of all downloaded PDFs. Close and reopen the PDF to apply updates.
+
+The first plugin open fetches a missing annotation cache. Later opens from Browse, Recent books and the file manager use it offline; reopening alone does not fetch cloud changes. Independent local annotations, bookmarks and reading progress are preserved. Local edits or deletions of imported entries reset on reopen. No annotations are uploaded or written into the PDF.
+
+**Browse → long-press PDF → Delete local file** removes the local PDF, annotation cache, bookmarks and reading progress after confirmation. Close an open PDF first. Its Zotero entry remains available for downloading again; cloud data is kept.
+
+Target: **Kindle Oasis 3 / official KOReader v2026.03 and v2026.07.2**, standard PDF pages. Highlights, underlines and area annotations include colors, text and comments; areas show a border and a comment on tap. Reflow hides imported overlays. EPUB annotations, notes, ink, unusual CropBoxes and intrinsic page rotation are unsupported. See [批注同步说明与验证记录](docs/annotation-sync.md) for details and device validation status.
+
 ### Download and synchronization progress
 
 Downloads show the bytes actually received, followed by extraction, verification and saving when needed. The transfer counter starts again for each redirect response; WebDAV counts the ZIP bytes received. No download percentage or ETA is shown because a reliable total size is not available while streaming.
@@ -96,6 +118,11 @@ From the repository root, run:
 lua tests/run.lua
 # or: luajit tests/run.lua
 # or, with Pandoc's embedded Lua: pandoc lua tests/run.lua
+
+# Optional checks with a real JSON parser and KOReader v2026.03 Lua modules:
+pandoc lua tests/json-integration.lua
+pandoc lua tests/koreader-integration.lua /path/to/koreader/frontend
+pandoc lua tests/localfiles-integration.lua /path/to/koreader/frontend/docsettings.lua
 ```
 
 The offline suite uses KOReader/HTTP/JSON/crypto test doubles, real temporary files and real `unzip` operations. It requires no account credentials or network access. JSON and digest test doubles exercise protocol decisions, not the correctness of those external libraries. Live Zotero and WebDAV checks are recorded in the API audit; the computer transport adapters do not validate Kindle's LuaSocket/TLS or screen/input behavior.

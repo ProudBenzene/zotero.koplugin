@@ -3,6 +3,7 @@ local Screen = require("device").screen
 local UIManager = require("ui/uimanager")
 local time = require("ui/time")
 local _ = require("gettext")
+local Annotations = require("annotations")
 
 -- A conservative cadence for Kindle e-ink panels, including older devices.
 local REFRESH_INTERVAL = time.s(2)
@@ -24,6 +25,11 @@ local stages = {
     retrying = _("Library changed. Restarting synchronization…"),
     up_to_date = _("Library is up to date."),
     complete = _("Complete."),
+    annotations = Annotations.text("Fetching PDF annotations…"),
+    annotation_files = Annotations.text("Synchronizing downloaded PDF annotations"),
+    checking_annotation_file = Annotations.text("Checking annotation file…"),
+    saving_annotations = Annotations.text("Saving PDF annotations…"),
+    retrying_annotations = Annotations.text("Annotations changed. Retrying…"),
 }
 
 local function format_bytes(bytes)
@@ -43,9 +49,11 @@ function ProgressDialog:init()
     -- Fixed geometry keeps old text covered when a status becomes shorter.
     self.width = math.floor(Screen:getWidth() * 0.8)
     self.height = math.min(Screen:scaleBySize(180), math.floor(Screen:getHeight() * 0.6))
-    self.title = self.operation == "sync" and _("Synchronizing Zotero library") or _("Downloading attachment")
+    self.title = self.operation == "sync" and _("Synchronizing Zotero library")
+        or self.operation == "annotations" and Annotations.text("Refreshing PDF annotations") or _("Downloading attachment")
     if not self.text or self.text == "" then
-        local initial_stage = self.operation == "sync" and stages.checking_account or _("Waiting for response…")
+        local initial_stage = (self.operation == "sync" or self.operation == "annotations")
+            and stages.checking_account or _("Waiting for response…")
         self.text = self.title .. "\n" .. initial_stage
     end
     InfoMessage.init(self)

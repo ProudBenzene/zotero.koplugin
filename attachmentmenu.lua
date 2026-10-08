@@ -11,6 +11,17 @@ local chinese = {
     ["Filename: %s"] = "文件名：%s", ["Format: %s"] = "格式：%s",
     ["Status: %s"] = "状态：%s", ["Local size: %s"] = "本地大小：%s",
     ["File modified: %s"] = "文件修改时间：%s", ["Open"] = "打开",
+    ["Delete local file"] = "删除本地文件",
+    ["Delete this local PDF, its annotations, bookmarks and reading progress? Zotero cloud data is kept. You can download it again."]
+        = "删除本机 PDF 及其批注、书签和阅读进度？Zotero 云端数据保留，之后可以重新下载。",
+    ["Local PDF and annotations deleted."] = "已删除本机 PDF 及批注。",
+    ["Local PDF deleted; some local data could not be removed."] = "本机 PDF 已删除，但部分本地数据未能清理。",
+    ["Could not delete the local PDF."] = "无法删除本机 PDF。",
+    ["Close this PDF before deleting its local copy."] = "请先关闭此 PDF，再删除本地文件。",
+    ["Local PDF not found."] = "未找到本机 PDF。",
+    ["Only downloaded PDF attachments can be removed."] = "只能删除已下载的 PDF 附件。",
+    ["The PDF path does not match its attachment storage."] = "PDF 路径与附件存储目录不匹配。",
+    ["The local PDF changed. Open its details again."] = "本机 PDF 已发生变化，请重新打开附件信息。",
     ["Long-press a file to see its full name and details."] = "长按附件可查看完整名称和详细信息。",
 }
 

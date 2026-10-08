@@ -219,6 +219,7 @@ function API.init(zotero_dir, reuse_state)
         API.backoff_until = 0
         API.backoff_attempts = 0
         API.sync_in_progress = false
+        API.annotation_access = nil
     end
     ok, err = update_storage_dir()
     if not ok then error("Could not create attachment storage: " .. tostring(err)) end
@@ -365,7 +366,7 @@ function API.verifyResponse(result, code)
     if code ~= 200 then return "Error: API responded with status code " .. tostring(code) end
 end
 
-local function fetch_json(url, headers, allow_not_modified, progress_callback, retry_callback)
+local function fetch_json(url, headers, allow_not_modified, progress_callback, retry_callback, expect_array)
     for attempt = 1, MAX_METADATA_ATTEMPTS do
         local response, received = {}, 0
         local result, code, response_headers = request({
@@ -385,8 +386,10 @@ local function fetch_json(url, headers, allow_not_modified, progress_callback, r
             retryable = true
         end
         if not err then
-            local ok, data = pcall(JSON.decode, table.concat(response))
+            local content = table.concat(response)
+            local ok, data = pcall(JSON.decode, content)
             if not ok or type(data) ~= "table" then return nil, "Error: failed to parse JSON in response" end
+            if expect_array and not content:match("^%s*%[") then return nil, "Error: expected a JSON array in Zotero response" end
             return data, nil, response_headers
         end
         if not retryable or attempt == MAX_METADATA_ATTEMPTS then return nil, err end
@@ -435,7 +438,7 @@ function API.fetchCollectionPaginated(collection_url, headers, callback, expecte
         local data, err, response_headers = fetch_json(page_url, headers, conditional,
             transfer_progress(progress_callback, stage, { completed = completed, total = total, page = page }),
             function(attempt) report_progress(progress_callback, "retrying_request", {
-                page = page, attempt = attempt, completed = completed, total = total }) end)
+                page = page, attempt = attempt, completed = completed, total = total }) end, true)
         if err then
             if err == NOT_MODIFIED then return nil, err end
             return failure(err)
@@ -445,11 +448,14 @@ function API.fetchCollectionPaginated(collection_url, headers, callback, expecte
         if err then return failure(err) end
         if version and version ~= page_version then return nil, LIBRARY_CHANGED end
         version = page_version
+        local count = 0
         for index in pairs(data) do
             if type(index) ~= "number" or index < 1 or index % 1 ~= 0 or index > #data then
                 return failure("Error: expected a JSON array in Zotero response")
             end
+            count = count + 1
         end
+        if count ~= #data then return failure("Error: incomplete JSON array in Zotero response") end
         for _, item in ipairs(data) do
             if type(item) ~= "table" or type(item.key) ~= "string" or type(item.data) ~= "table" then
                 return failure("Error: invalid object in Zotero response")
@@ -458,27 +464,41 @@ function API.fetchCollectionPaginated(collection_url, headers, callback, expecte
         end
         if callback then callback(data) end
         completed = completed + #data
-        local reported_total = tonumber(header(response_headers, "total-results"))
-        total = reported_total or total
-        if total and (total < completed or total % 1 ~= 0) then total = nil end
+        local raw_total = header(response_headers, "total-results")
+        if raw_total ~= nil then
+            local reported_total = tonumber(raw_total)
+            if not reported_total or reported_total < completed or reported_total % 1 ~= 0
+                or total and total ~= reported_total then
+                return failure("Error: inconsistent Total-Results header")
+            end
+            total = reported_total
+        end
         report_progress(progress_callback, stage, { completed = completed, total = total, page = page })
         page_url = nil
         for link, relation in (header(response_headers, "link") or ""):gmatch('<([^>]+)>;%s*rel="([^"]+)"') do
             if relation == "next" then page_url = URL.absolute(collection_url, link) end
         end
     end
+    if total and completed ~= total then return failure("Error: incomplete pagination") end
     if callback then return version end
     return items, nil, version
 end
 
 local function verify_key(api_key, user_id, progress_callback)
+    API.annotation_access = nil
     local key, err = fetch_json(API_ROOT .. "/keys/current", API.getHeaders(api_key), false,
         transfer_progress(progress_callback, "checking_account"))
     if err then return err end
-    if tostring(key.userID) ~= user_id then return "Error: the API key does not belong to this User ID" end
+    local owner = key.userID
+    -- JSON codecs may decode integer IDs as floating-point numbers (123.0).
+    if type(owner) == "number" and owner >= 0 and owner < math.huge and owner % 1 == 0 then
+        owner = ("%.0f"):format(owner)
+    end
+    if tostring(owner) ~= user_id then return "Error: the API key does not belong to this User ID" end
     if type(key.access) ~= "table" or type(key.access.user) ~= "table" or not key.access.user.library then
         return "Error: the API key does not permit reading your library"
     end
+    API.annotation_access = { user_id = user_id, fingerprint = sha2.sha256(api_key) }
 end
 
 local function sync_library(api_key, user_id, progress_callback)
@@ -927,6 +947,61 @@ function API.downloadAndGetPath(key, download_callback, progress_callback)
     local ok, path, err = pcall(download_attachment, key, download_callback, progress_callback)
     if not ok then return nil, "Could not download attachment: " .. tostring(path) end
     return path, err
+end
+
+-- Independent, complete child snapshots. Never advance the main library cursor:
+-- it may still need to fetch changes to other objects at this response version.
+function API.fetchAttachmentAnnotations(key, progress_callback)
+    local ok, snapshot, err = pcall(function()
+        local account_err, api_key, user_id = API.ensureKeyAndID()
+        if account_err then return nil, account_err end
+        local _, path, path_err = API.getDirAndPath(key)
+        if not path then return nil, path_err end
+        local item = API.getItems()[key]
+        if item.data.contentType ~= "application/pdf" then return nil, "Only PDF annotations are supported" end
+        local access = API.annotation_access
+        if not access or access.user_id ~= user_id or access.fingerprint ~= sha2.sha256(api_key) then
+            account_err = verify_key(api_key, user_id, progress_callback)
+            if account_err then return nil, "Checking Zotero account: " .. account_err end
+        end
+        local headers = API.getHeaders(api_key)
+        local prefix = API_ROOT .. "/users/" .. user_id .. "/items/" .. key
+        for attempt = 1, MAX_SYNC_ATTEMPTS do
+            local items, fetch_err, version = API.fetchCollectionPaginated(
+                prefix .. "/children?itemType=annotation", headers, nil, nil, progress_callback, "annotations")
+            if not fetch_err then
+                local attachment
+                attachment, fetch_err = fetch_json(prefix, headers, false,
+                    transfer_progress(progress_callback, "checking_annotation_file"))
+                if not fetch_err then
+                    if attachment.key ~= key or type(attachment.data) ~= "table"
+                        or attachment.data.itemType ~= "attachment" or attachment.data.contentType ~= "application/pdf"
+                        or attachment.data.deleted == true or attachment.data.deleted == 1
+                        or type(attachment.version) ~= "number" or attachment.version < 0
+                        or attachment.version % 1 ~= 0 then
+                        return nil, "Invalid PDF attachment in annotation response"
+                    end
+                    -- Parent read follows the children. A newer parent cannot describe
+                    -- the PDF as it existed at the child snapshot's library version.
+                    if attachment.version > version then fetch_err = LIBRARY_CHANGED
+                    else
+                        local md5 = attachment_md5(attachment)
+                        return { format = 1, user_id = user_id, attachment_key = key,
+                            library_version = version,
+                            file_identity = md5 and { md5 = md5 } or { version = attachment.version },
+                            items = items }
+                    end
+                end
+            end
+            if fetch_err ~= LIBRARY_CHANGED or attempt == MAX_SYNC_ATTEMPTS then return nil, fetch_err end
+            account_err = backoff_error()
+            if account_err then return nil, account_err end
+            report_progress(progress_callback, "retrying_annotations", { attempt = attempt + 1 })
+            BaseUtil.usleep(100000 * 2 ^ (attempt - 1))
+        end
+    end)
+    if not ok then return nil, "Could not fetch PDF annotations: " .. tostring(snapshot) end
+    return snapshot, err
 end
 
 local function parent_item(items, item)

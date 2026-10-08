@@ -19,6 +19,10 @@ local AttachmentMenu = require("attachmentmenu")
 local TextViewer = require("ui/widget/textviewer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local lfs = require("libs/libkoreader-lfs")
+local Annotations = require("annotations")
+local LocalFiles = require("localfiles")
+local ConfirmBox = require("ui/widget/confirmbox")
+local logger = require("logger")
 
 
 local DEFAULT_LINES_PER_PAGE = 14
@@ -122,6 +126,13 @@ function ZoteroBrowser:onMenuSelect(item)
                 self.download_dialog:update(event)
             end)
             if not ok then e, full_path = tostring(full_path), nil end
+            local annotation_error
+            if full_path and not e then
+                local cached_ok, cached_result, cache_err = pcall(Annotations.ensureCached, ZoteroAPI, item.key, function(event)
+                    self.download_dialog:update(event)
+                end)
+                annotation_error = cached_ok and cache_err or (not cached_ok and tostring(cached_result)) or nil
+            end
             self.downloading = false
             UIManager:close(self.download_dialog)
             if e ~= nil then
@@ -136,6 +147,12 @@ function ZoteroBrowser:onMenuSelect(item)
                 local ReaderUI = require("apps/reader/readerui")
                 self.close_callback()
                 ReaderUI:showReader(full_path)
+                if annotation_error then
+                    UIManager:show(InfoMessage:new{
+                        text = Annotations.text("PDF annotations were not updated.") .. "\n" .. annotation_error,
+                        icon = "notice-warning", honor_silent_mode = false,
+                    })
+                end
             end
         end)
         UIManager:show(self.download_dialog)
@@ -145,21 +162,96 @@ end
 function ZoteroBrowser:onMenuHold(item)
     if item.collection or item.is_label or item.wildcard_collection then return true end
     local details
-    details = TextViewer:new{
-        title = AttachmentMenu.text("Attachment details"),
-        text = AttachmentMenu.details(item),
-        show_menu = false,
-        buttons_table = not item.attachment_group and {{ {
+    local buttons
+    if not item.attachment_group then
+        buttons = {{ {
             text = AttachmentMenu.text("Open"),
             callback = function()
                 UIManager:close(details)
                 self:onMenuSelect(item)
             end,
-        } }} or nil,
+        } }}
+        local attachment = ZoteroAPI.getItems()[item.key]
+        if attachment and attachment.data.contentType == "application/pdf" then
+            buttons[#buttons + 1] = {{
+                text = Annotations.text("Refresh annotations"),
+                enabled = ZoteroAPI.getAttachmentStatus(item.key) ~= "not_downloaded",
+                callback = function()
+                    UIManager:close(details)
+                    self:refreshAnnotations(item)
+                end,
+            }}
+            buttons[#buttons + 1] = {{
+                text = AttachmentMenu.text("Delete local file"),
+                enabled = LocalFiles.getPDFPath(ZoteroAPI, item.key) ~= nil,
+                callback = function()
+                    UIManager:close(details)
+                    self:confirmDeleteLocalPDF(item)
+                end,
+            }}
+        end
+    end
+    details = TextViewer:new{
+        title = AttachmentMenu.text("Attachment details"),
+        text = AttachmentMenu.details(item),
+        show_menu = false,
+        buttons_table = buttons,
         add_default_buttons = true,
     }
     UIManager:show(details)
     return true
+end
+
+function ZoteroBrowser:confirmDeleteLocalPDF(item)
+    if self.downloading then return end
+    local _, path, err = LocalFiles.getPDFPath(ZoteroAPI, item.key)
+    if not path then
+        UIManager:show(InfoMessage:new{ text = AttachmentMenu.text(err), icon = "notice-warning" })
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text = AttachmentMenu.text("Delete this local PDF, its annotations, bookmarks and reading progress? Zotero cloud data is kept. You can download it again.")
+            .. "\n\n" .. ZoteroAPI.getItems()[item.key].data.filename,
+        ok_text = AttachmentMenu.text("Delete local file"),
+        ok_callback = function()
+            if self.downloading then return end
+            local ok, deleted, message = pcall(LocalFiles.removePDF, ZoteroAPI, item.key, path)
+            if not ok then message, deleted = tostring(deleted), nil end
+            if deleted then
+                self:showView(self.current_view)
+                self.refresh_callback()
+            end
+            local text = deleted and (message and AttachmentMenu.text("Local PDF deleted; some local data could not be removed.")
+                or AttachmentMenu.text("Local PDF and annotations deleted."))
+                or AttachmentMenu.text("Could not delete the local PDF.")
+            if message then text = text .. "\n" .. AttachmentMenu.text(message) end
+            UIManager:show(InfoMessage:new{
+                text = text,
+                icon = deleted and not message and "check" or "notice-warning",
+                honor_silent_mode = false,
+            })
+        end,
+    })
+end
+
+function ZoteroBrowser:refreshAnnotations(item)
+    if self.downloading or ZoteroAPI.getAttachmentStatus(item.key) == "not_downloaded" then return end
+    self.downloading = true
+    local message = ProgressDialog:new{ operation = "annotations" }
+    UIManager:show(message)
+    UIManager:scheduleIn(0.05, function()
+        local ok, cache, err = pcall(Annotations.ensureCached, ZoteroAPI, item.key,
+            function(event) message:update(event) end, true)
+        if not ok then err = tostring(cache) end
+        self.downloading = false
+        UIManager:close(message)
+        UIManager:show(InfoMessage:new{
+            text = ok and cache and (Annotations.text("PDF annotations updated.") .. "\n" ..
+                Annotations.text("Cached annotations take effect when the PDF is next opened."))
+                or (Annotations.text("PDF annotations were not updated.") .. "\n" .. tostring(err)),
+            icon = ok and cache and "check" or "notice-warning", honor_silent_mode = false,
+        })
+    end)
 end
 
 function ZoteroBrowser:displayAttachments(parent_key)
@@ -244,6 +336,52 @@ function Plugin:init()
     self.ui.menu:registerToMainMenu(self)
     self.initialized = xpcall(function() self:initAPIAndBrowser() end,
         function(err) return self:initError(err) end)
+    if self.initialized and self.ui.doc_settings then
+        self:prepareAnnotationImport(self.ui.doc_settings, self.ui.document)
+    end
+end
+
+function Plugin:prepareAnnotationImport(config, document)
+    self.annotation_key = nil
+    if not self.initialized then return end
+    local ok, key = pcall(Annotations.managedKey, ZoteroAPI, document)
+    if not ok or not key then return end
+    self.annotation_key = key
+    config:saveSetting("highlight_write_into_pdf", false)
+end
+
+function Plugin:onDocSettingsLoad(config, document)
+    self:prepareAnnotationImport(config, document)
+end
+
+function Plugin:onReadSettings(config)
+    -- Other handlers (notably docsettingtweak) can consume DocSettingsLoad.
+    -- Resolve the current PDF again after native settings/migration instead of
+    -- relying on that earlier event to have reached this plugin.
+    self:prepareAnnotationImport(config, self.ui.document)
+    if not self.annotation_key then return end
+    if self.ui.highlight then self.ui.highlight.highlight_write_into_pdf = false end
+    local ok, result, err = pcall(Annotations.applyToReader, ZoteroAPI, self.ui, config, self.annotation_key)
+    if not ok then err = tostring(result) end
+    if err then
+        logger.warn("Zotero annotation import failed", self.annotation_key, err)
+    elseif result then
+        logger.info("Zotero annotations applied", self.annotation_key, result.imported, "imported", result.unsupported, "unsupported")
+    end
+    local message
+    if err then message = Annotations.text("Could not apply Zotero annotations.") .. "\n" .. err
+    elseif result and result.imported > 0 and self.ui.document.configurable.text_wrap == 1 then
+        message = Annotations.text("Zotero annotations are displayed in original-page mode.")
+    end
+    if message then
+        self.ui:registerPostReaderReadyCallback(function()
+            UIManager:show(InfoMessage:new{ text = message, icon = "notice-warning", honor_silent_mode = false })
+        end)
+    end
+end
+
+function Plugin:onAnnotationsModified()
+    if self.annotation_key then Annotations.reindex(self.ui) end
 end
 
 function Plugin:initError(e)
@@ -319,6 +457,10 @@ function Plugin:addToMainMenu(menu_items)
                             ZoteroAPI.resetSyncState()
                             self:onZoteroSyncAction()
                         end,
+                    },
+                    {
+                        text = Annotations.text("Refetch downloaded PDF annotations"),
+                        callback = function() self:onZoteroSyncAction(true) end,
                     },
                 },
             },
@@ -538,7 +680,7 @@ function Plugin:onZoteroOpenAction()
     end
 end
 
-function Plugin:onZoteroSyncAction()
+function Plugin:onZoteroSyncAction(force_annotations)
     if not self:checkInitialized() then
         return
     end
@@ -549,7 +691,9 @@ function Plugin:onZoteroSyncAction()
         local ok, e, summary = pcall(function()
             local err = ZoteroAPI.syncAllItems(function(event) message:update(event) end)
             if err then return err end
-            return nil, ZoteroAPI.getLibrarySummary()
+            local summary = ZoteroAPI.getLibrarySummary()
+            summary.annotations = Annotations.refreshDownloaded(ZoteroAPI, function(event) message:update(event) end, force_annotations)
+            return nil, summary
         end)
         if not ok then e = tostring(e) end
         self.syncing = false
@@ -559,10 +703,10 @@ function Plugin:onZoteroSyncAction()
             UIManager:show(InfoMessage:new{
                 text = _("Synchronization complete.") .. "\n" ..
                     (_("Library items: %d\nCollections: %d\nVisible PDF/EPUB attachments: %d")):format(
-                        summary.items, summary.collections, summary.attachments),
+                        summary.items, summary.collections, summary.attachments) .. "\n" .. Annotations.summary(summary.annotations),
                 honor_silent_mode = false,
                 flush_events_on_show = true,
-                icon = "check"
+                icon = summary.annotations.failed > 0 and "notice-warning" or "check"
             })
         else
             UIManager:show(InfoMessage:new{
