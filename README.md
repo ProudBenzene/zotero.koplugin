@@ -11,6 +11,12 @@ This addon for [KOReader](https://github.com/koreader/koreader) allows you to vi
 
 基于 [源仓库](https://github.com/stelzch/zotero.koplugin)，主要更新：
 
+<p align="center">
+  <img width="32%" alt="Reader_Gordon 等 - 2023 - A somato-cognitive action network alternates with effector regions in motor cortex pdf_p6_2026-10-09_202142" src="https://github.com/user-attachments/assets/653a52ef-b84d-482e-906a-8f3ccca8a59e" />
+  <img width="32%" alt="Reader_Gordon 等 - 2023 - A somato-cognitive action network alternates with effector regions in motor cortex pdf_p7_2026-10-09_213158" src="https://github.com/user-attachments/assets/991af2c4-6b5d-43b9-a74a-e0278a2708a7" />
+  <img width="32%" alt="Reader_Gordon 等 - 2023 - A somato-cognitive action network alternates with effector regions in motor cortex pdf_p7_2026-10-09_213152" src="https://github.com/user-attachments/assets/bad8aad6-2468-43e2-8a5b-bc60176c4e89" />
+</p>
+
 - **单向 PDF 批注同步**：导入 Zotero 云端高亮、下划线、区域批注及颜色、文字、评论，支持云端修改与删除；点按区域可查看评论。
 - **手动更新与离线查看**：Synchronize / Resync 更新已下载 PDF 的批注；Browse 长按附件可单独更新。重开后应用，最近阅读和文件管理器也能离线显示缓存。
 - **释放本机空间**：Browse 长按 PDF → 删除本地文件，清理 PDF、批注、书签和阅读进度；云端保留，可重新下载。
