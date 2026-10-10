@@ -345,9 +345,13 @@ function Plugin:prepareAnnotationImport(config, document)
     self.annotation_key = nil
     if not self.initialized then return end
     local ok, key = pcall(Annotations.managedKey, ZoteroAPI, document)
-    if not ok or not key then return end
+    if not ok or not key then
+        Annotations.releaseReader(self.ui)
+        return
+    end
     self.annotation_key = key
     config:saveSetting("highlight_write_into_pdf", false)
+    Annotations.protectReader(ZoteroAPI, self.ui, key)
 end
 
 function Plugin:onDocSettingsLoad(config, document)

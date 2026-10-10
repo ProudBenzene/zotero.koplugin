@@ -286,6 +286,7 @@ describe("One-way Zotero PDF annotations",function()
         assert(list[1].color=="blue" and list[1].note=="Comment" and list[1].pageno==1)
         assert(list[2].pboxes[1].y==280 and list[2].drawer=="underscore" and list[2].color=="purple" and list[2].note==nil)
         assert(list[1].zotero_source.annotation_key=="ANNOT001" and list[1].zotero_source.version==10)
+        assert(list[1].zotero_source.annotation_color=="#2ea8e5" and list[2].zotero_source.annotation_color=="#e56eee")
     end)
 
     it("maps custom colors deterministically and retains the original source color",function()
@@ -294,6 +295,7 @@ describe("One-way Zotero PDF annotations",function()
         local list=assert(Annotations.convert(raw,reader().document))
         assert(list[1].color=="gray" or list[1].color=="olive")
         assert(raw.items[1].data.annotationColor=="#000000")
+        assert(list[1].zotero_source.annotation_color=="#000000")
     end)
 
     it("converts UTC and explicit-offset dates using the device timezone",function()
@@ -352,7 +354,7 @@ describe("One-way Zotero PDF annotations",function()
         assert(config.data.zotero_annotations_applied.library_version==11)
     end)
 
-    it("carries explicit ownership through native highlight extension and replacement",function()
+    it("blocks cloud highlight extension while allowing independent local replacement",function()
         cache({annotation()})
         local ui=reader();local config=settings()
         ui.annotation.addItem=function(self,item) self.annotations[#self.annotations+1]=item;return #self.annotations end
@@ -362,11 +364,9 @@ describe("One-way Zotero PDF annotations",function()
                 pos0={page=1,x=10,y=10},pos1={page=1,x=30,y=30}}
         end}
         assert(Annotations.applyToReader(API,ui,config,"ATTACH01"))
+        local cloud=ui.annotation.annotations[1]
         ui.highlight.highlight_idx=1;ui.highlight:extendSelection()
-        local replacement={page=1,drawer="lighten",text=ui.highlight.selected_text.text,
-            pos0=ui.highlight.selected_text.pos0,pos1=ui.highlight.selected_text.pos1}
-        ui.annotation:addItem(replacement)
-        assert(replacement.zotero_source.annotation_key=="ANNOT001")
+        assert(ui.annotation.annotations[1]==cloud and not ui.highlight.selected_text)
         ui.highlight.selected_text={text="A separate local highlight"}
         local native={page=2,drawer="lighten",text="Local"}
         ui.annotation:addItem(native)
@@ -607,12 +607,12 @@ describe("One-way Zotero PDF annotations",function()
         ui.highlight={showHighlightNoteOrDialog=function() delegated=delegated+1 end}
         assert(Annotations.applyToReader(API,ui,settings(),"ATTACH01"))
         ui.highlight:showHighlightNoteOrDialog(1)
-        assert(support.UI.shown[#support.UI.shown].text=="No comment." and delegated==0)
+        assert(support.UI.shown[#support.UI.shown].text:find("No comment.",1,true) and delegated==0)
         ui.annotation.annotations[1].note="区域的评论"
         ui.highlight:showHighlightNoteOrDialog(1)
-        assert(support.UI.shown[#support.UI.shown].text=="区域的评论")
+        assert(support.UI.shown[#support.UI.shown].text:find("区域的评论",1,true))
         ui.annotation.annotations[1].zotero_source.annotation_type="highlight"
-        ui.highlight:showHighlightNoteOrDialog(1);assert(delegated==1)
+        ui.highlight:showHighlightNoteOrDialog(1);assert(delegated==0)
     end)
 
     it("refreshes only a downloaded PDF from its hold menu and preserves the file",function()
@@ -676,6 +676,30 @@ describe("One-way Zotero PDF annotations",function()
         assert(plugin.annotation_key=="ATTACH01" and #ui.annotation.annotations==3)
         assert(config.data.highlight_write_into_pdf==false and ui.highlight.highlight_write_into_pdf==false)
         assert(config.data.percent_finished==0.7 and #support.requests==0 and support.read(path)=="hello")
+    end)
+
+    it("protects a managed PDF even without a usable cloud cache and restores an unmanaged instance",function()
+        local ui=reader({{page=1,text="Local bookmark"}})
+        local native_write=function() support.write(path,"unexpected PDF edit");return true end
+        ui.document.writeDocument=native_write
+        ui.document.saveHighlight=native_write
+        ui.document.deleteHighlight=native_write
+        ui.document.updateHighlightContents=native_write
+        ui.document._checkIfWritable=function() return true end
+        ui.highlight={writePdfAnnotation=native_write,highlight_write_into_pdf=true}
+        local plugin=support.plugin();plugin.ui=ui
+        local config=settings({highlight_write_into_pdf=true,percent_finished=0.4})
+        plugin:onReadSettings(config)
+        assert(ui.document:writeDocument()==false and ui.document:saveHighlight()==false)
+        assert(ui.document:deleteHighlight()==false and ui.document:updateHighlightContents()==false)
+        assert(ui.highlight:writePdfAnnotation()==false and not ui.document:_checkIfWritable())
+        assert(support.read(path)=="hello" and #ui.annotation.annotations==1 and config.data.percent_finished==0.4)
+        support.write(directory.."/.zotero-annotations.json","broken cache")
+        plugin:onReadSettings(config)
+        assert(ui.document:writeDocument()==false and support.read(path)=="hello")
+        ui.document.file=path..".unmanaged.pdf"
+        plugin:prepareAnnotationImport(settings({highlight_write_into_pdf=true}),ui.document)
+        assert(not ui.document._zotero_policy and ui.document.writeDocument==native_write)
     end)
 
     it("prepares a managed PDF before native settings events during plugin initialization",function()

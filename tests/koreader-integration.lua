@@ -2,7 +2,7 @@
 -- geometry and paint primitives. This does not test MuPDF, pixels or hardware.
 -- Usage: pandoc lua tests/koreader-integration.lua /path/to/koreader/frontend
 package.path = "./?.lua;./tests/?.lua;" .. package.path
-local source_dir = assert(arg[1], "Supply a KOReader frontend directory (target: v2026.03)")
+local source_dir = assert(arg[1], "Supply a KOReader frontend directory (target: v2026.07.2)")
 local support = require("tests/support")
 local API = support.setup()
 local Annotations = require("annotations")
@@ -180,7 +180,11 @@ local ok, err = xpcall(function()
     ui.highlight.hold_pos = nil
     ui.highlight:showHighlightDialog(1)
     local dialog = support.UI.shown[#support.UI.shown]
-    dialog.buttons[1][6].callback()
+    local more
+    for _,row in ipairs(dialog.buttons_table) do
+        for _,button in ipairs(row) do if button.text=="…" then more=button end end
+    end
+    more.callback()
     ui.highlight.highlight_dialog.tap_close_callback()
     ui.highlight:clear()
     check(ui.highlight.selected_text.zotero_source~=nil,"Native More-menu leaves cloud selection present")
@@ -240,12 +244,12 @@ local ok, err = xpcall(function()
     ui.highlight.hold_pos={page=2}
     ui.highlight.selected_text={pos0={page=2,x=200,y=720},pos1={page=2,x=210,y=730},text="New fragment"}
     editing=true
+    local previous=ui.annotation.annotations[ui.highlight.highlight_idx]
     ui.highlight:extendSelection()
-    local index=ui.highlight:saveHighlight()
     editing=false
-    check(ui.annotation.annotations[index].zotero_source.annotation_key=="ANNOT002","Native extension/save retains provenance")
+    check(ui.annotation.annotations[ui.highlight.highlight_idx]==previous and previous.text=="Cloud text","Cloud extension is blocked before native replacement")
     plugin:onReadSettings(config)
-    check(#ui.annotation.annotations==4,"Reopening after an extension restores cloud items without a local duplicate")
+    check(#ui.annotation.annotations==4,"Reopening after a blocked extension keeps cloud and local items")
     local region=annotation("REGION01",1,{{120,100,220,140}},nil,"image")
     region.data.annotationText=""
     region.data.annotationComment="A figure comment"
@@ -262,7 +266,7 @@ local ok, err = xpcall(function()
     local rect=region_paint.rect
     ui.highlight.screen_w,ui.highlight.screen_h=600,800
     check(ui.highlight:onTap(nil,{pos={x=rect.x+10,y=rect.y+10}}),"Native tap detects an image annotation's interior")
-    check(support.UI.shown[#support.UI.shown].text=="A figure comment","Native tap opens the area comment viewer")
+    check(support.UI.shown[#support.UI.shown].text:find("A figure comment",1,true),"Native tap opens the read-only area comment viewer")
     ui.document.configurable.text_wrap=1
     painted=draw(2,2,visible)
     check(#painted==0,"Reflow also hides area rectangles")

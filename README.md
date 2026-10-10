@@ -21,6 +21,7 @@ This addon for [KOReader](https://github.com/koreader/koreader) allows you to vi
 - **手动更新与离线查看**：Synchronize / Resync 更新已下载 PDF 的批注；Browse 长按附件可单独更新。重开后应用，最近阅读和文件管理器也能离线显示缓存。
 - **释放本机空间**：Browse 长按 PDF → 删除本地文件，清理 PDF、批注、书签和阅读进度；云端保留，可重新下载。
 - **保留本地数据**：独立批注缓存，保留本地批注、书签和阅读进度；不上传批注，不改写 PDF。
+- **云端批注只读**：禁止在 KOReader 修改或删除 Zotero 导入项；独立本地批注仍可编辑。受管 PDF 的原文件写入、批量写入及内嵌批注导入被阻止。
 - **同步与下载修复**：库版本一致性、增量删除、Zotero Storage / WebDAV 文件校验、网络重试与截断续传；失败保留旧缓存。
 - **浏览与性能优化**：同文献多附件分组、下载状态与长按详情、精简大库缓存，以及适合电子墨水屏的同步和下载进度。
 
@@ -86,11 +87,13 @@ The local metadata cache keeps the fields used for browsing, searching and downl
 
 **Synchronize** and **Resync entire collection** update annotations for downloaded PDFs only. For one PDF, use **Browse → long-press attachment → Refresh annotations**. **Maintenance → Refetch downloaded PDF annotations** forces a refresh of all downloaded PDFs. Close and reopen the PDF to apply updates.
 
-The first plugin open fetches a missing annotation cache. Later opens from Browse, Recent books and the file manager use it offline; reopening alone does not fetch cloud changes. Independent local annotations, bookmarks and reading progress are preserved. Local edits or deletions of imported entries reset on reopen. No annotations are uploaded or written into the PDF.
+The first plugin open fetches a missing annotation cache. Later opens from Browse, Recent books and the file manager use it offline; reopening alone does not fetch cloud changes. Zotero imports are read-only in KOReader: view, copy, dictionary lookup and navigation remain available; edit them in Zotero, synchronize and reopen. Independent local annotations can be created, edited and deleted in KOReader document settings; bookmarks and reading progress are preserved. Mixed bulk operations skip imported entries and report their count. No annotations are uploaded.
+
+For PDFs managed by the current Zotero account, the plugin blocks native PDF annotation writes, batch writes and embedded-annotation import, including attempts to re-enable writing. Local annotations stay in KOReader settings and never modify the downloaded PDF. Ordinary PDFs, EPUBs and files belonging to another account retain native behavior.
 
 **Browse → long-press PDF → Delete local file** removes the local PDF, annotation cache, bookmarks and reading progress after confirmation. Close an open PDF first. Its Zotero entry remains available for downloading again; cloud data is kept.
 
-Target: **Kindle Oasis 3 / official KOReader v2026.03 and v2026.07.2**, standard PDF pages. Highlights, underlines and area annotations include colors, text and comments; areas show a border and a comment on tap. Reflow hides imported overlays. EPUB annotations, notes, ink, unusual CropBoxes and intrinsic page rotation are unsupported. See [批注同步说明与验证记录](docs/annotation-sync.md) for details and device validation status.
+Target: **Kindle Oasis 3 / official KOReader v2026.07.2**, standard PDF pages. Earlier annotation builds were also checked against v2026.03; the new read-only restrictions have not been rechecked on that version. Highlights, underlines and area annotations include colors, text and comments; areas show a border and a comment on tap. Reflow hides imported overlays. EPUB annotations, notes, ink, unusual CropBoxes and intrinsic page rotation are unsupported. See [批注同步说明与验证记录](docs/annotation-sync.md) for details and device validation status.
 
 ### Download and synchronization progress
 
@@ -125,9 +128,10 @@ lua tests/run.lua
 # or: luajit tests/run.lua
 # or, with Pandoc's embedded Lua: pandoc lua tests/run.lua
 
-# Optional checks with a real JSON parser and KOReader v2026.03 Lua modules:
+# Optional checks with a real JSON parser and KOReader v2026.07.2 Lua modules:
 pandoc lua tests/json-integration.lua
 pandoc lua tests/koreader-integration.lua /path/to/koreader/frontend
+pandoc lua tests/annotationpolicy-integration.lua /path/to/koreader/frontend
 pandoc lua tests/localfiles-integration.lua /path/to/koreader/frontend/docsettings.lua
 ```
 

@@ -5,10 +5,11 @@ local lfs = require("libs/libkoreader-lfs")
 local Blitbuffer = require("ffi/blitbuffer")
 local BaseUtil = require("ffi/util")
 local _ = require("gettext")
+local AnnotationPolicy = require("annotationpolicy")
 local Annotations = {}
 local CACHE_NAME = ".zotero-annotations.json"
 local SOURCE = "zotero.koplugin"
-local CONVERTER_VERSION = 2
+local CONVERTER_VERSION = 3
 local SUPPORTED = { highlight = "lighten", underline = "underscore", image = "zotero_region" }
 local FIELDS = { "annotationType", "annotationPosition", "annotationText", "annotationComment",
     "annotationColor", "annotationPageLabel", "annotationSortIndex", "dateAdded", "dateModified" }
@@ -25,6 +26,16 @@ local chinese = {
     ["PDF annotations updated."] = "PDF 批注已更新。",
     ["Area annotation"] = "区域批注",
     ["No comment."] = "无附属评论。",
+    ["Go to annotation"] = "转到批注",
+    ["Yellow"] = "黄", ["Red"] = "红", ["Green"] = "绿", ["Blue"] = "蓝", ["Purple"] = "紫",
+    ["Magenta"] = "品红", ["Orange"] = "橙", ["Gray"] = "灰", ["Olive"] = "橄榄", ["Cyan"] = "青",
+    ["Zotero annotations are read-only"] = "Zotero 批注只读",
+    ["Edit this annotation in Zotero, then synchronize and reopen the PDF."] = "请在 Zotero 中修改此批注，然后同步并重新打开 PDF。",
+    ["PDF file protected by Zotero"] = "Zotero PDF 原文件已保护",
+    ["This Zotero PDF is protected. Local annotations are saved in KOReader settings."] = "此 Zotero PDF 原文件已保护。本地批注保存于 KOReader 文档设置。",
+    ["Apply current style and color to local highlights? Zotero annotations stay read-only."] = "将当前样式和颜色应用于本地高亮？Zotero 批注保持只读。",
+    ["Update selected local annotations? Zotero annotations stay read-only."] = "修改选中的本地批注？Zotero 批注保持只读。",
+    ["Local annotations updated: %d; read-only Zotero annotations skipped: %d"] = "已修改本地批注：%d；已跳过只读 Zotero 批注：%d",
     ["PDF annotations were not updated."] = "PDF 批注未更新。",
     ["Could not apply Zotero annotations."] = "未能显示 Zotero 批注。",
     ["Zotero annotations are displayed in original-page mode."] = "Zotero 批注支持原版页面显示，请关闭文字重排。",
@@ -360,7 +371,7 @@ function Annotations.convert(snapshot, document)
                     datetime = datetime, datetime_updated = updated ~= datetime and updated or nil,
                     zotero_source = { plugin = SOURCE, user_id = snapshot.user_id, attachment_key = snapshot.attachment_key,
                         annotation_key = item.key, version = item.version, sort_index = data.annotationSortIndex,
-                        annotation_type = data.annotationType } }
+                        annotation_type = data.annotationType, annotation_color = data.annotationColor } }
                 if data.annotationType == "image" and converted.text == "" then
                     converted.text = Annotations.text("Area annotation")
                 end
@@ -391,6 +402,15 @@ local function owned(item, user_id, key)
         and source.user_id == user_id and source.attachment_key == key
 end
 
+function Annotations.protectReader(api, ui, key)
+    local user_id = current_user(api)
+    AnnotationPolicy.install(ui, function(item) return owned(item, user_id, key) end, Annotations.text)
+end
+
+function Annotations.releaseReader(ui)
+    AnnotationPolicy.remove(ui)
+end
+
 -- Resolve only this account's managed storage paths. Opening an arbitrary PDF
 -- or a document belonging to another account must not touch its annotations.
 function Annotations.managedKey(api, document)
@@ -412,6 +432,7 @@ end
 -- Instance-local adapter: cloud boxes are authoritative, even without an OCR
 -- text layer. Ordinary KOReader annotations still use the original methods.
 function Annotations.installAdapter(ui, user_id, key)
+    AnnotationPolicy.install(ui, function(item) return owned(item, user_id, key) end, Annotations.text)
     local document = ui.document
     local state = document._zotero_adapter
     if not state then
@@ -475,35 +496,6 @@ function Annotations.installAdapter(ui, user_id, key)
         end
         ui.annotation._zotero_match_adapter = true
     end
-    if ui.highlight and type(ui.highlight.extendSelection) == "function" and not ui.highlight._zotero_extend_adapter then
-        local extend = ui.highlight.extendSelection
-        ui.highlight.extendSelection = function(reader, ...)
-            local item = ui.annotation.annotations[reader.highlight_idx]
-            local source = item and owned(item, user_id, key) and item.zotero_source
-            local result = extend(reader, ...)
-            -- Native extension replaces the item via selected_text and drops
-            -- unknown fields. Carry its explicit identity through that path.
-            if source and reader.selected_text then reader.selected_text.zotero_source = source end
-            return result
-        end
-        ui.highlight._zotero_extend_adapter = true
-    end
-    if ui.highlight and type(ui.annotation.addItem) == "function" and not ui.annotation._zotero_add_adapter then
-        local add = ui.annotation.addItem
-        ui.annotation.addItem = function(reader, item)
-            local selection = ui.highlight.selected_text
-            -- Native saveHighlight reuses the selection's endpoint objects.
-            -- A dismissed More-menu can retain that selection; bookmarks and
-            -- unrelated highlights must not inherit its cloud identity.
-            if selection and owned(selection, user_id, key) and item.drawer
-                and item.pos0 and item.pos1
-                and item.pos0 == selection.pos0 and item.pos1 == selection.pos1 then
-                item.zotero_source = selection.zotero_source
-            end
-            return add(reader, item)
-        end
-        ui.annotation._zotero_add_adapter = true
-    end
     if ui.highlight and type(ui.highlight.getPageSavedHighlights) == "function" and not ui.highlight._zotero_pages_adapter then
         local get_highlights = ui.highlight.getPageSavedHighlights
         ui.highlight.getPageSavedHighlights = function(reader, page)
@@ -525,22 +517,6 @@ function Annotations.installAdapter(ui, user_id, key)
             return highlights, offset
         end
         ui.highlight._zotero_pages_adapter = true
-    end
-    if ui.highlight and type(ui.highlight.showHighlightNoteOrDialog) == "function" and not ui.highlight._zotero_region_note_adapter then
-        local show = ui.highlight.showHighlightNoteOrDialog
-        ui.highlight.showHighlightNoteOrDialog = function(reader, index)
-            local item = ui.annotation.annotations[index]
-            if item and owned(item, user_id, key) and item.zotero_source.annotation_type == "image" then
-                local TextViewer = require("ui/widget/textviewer")
-                require("ui/uimanager"):show(TextViewer:new{
-                    title = Annotations.text("Area annotation"), show_menu = false,
-                    text = item.note or Annotations.text("No comment."), add_default_buttons = true,
-                })
-                return true
-            end
-            return show(reader, index)
-        end
-        ui.highlight._zotero_region_note_adapter = true
     end
     if ui.view and type(ui.view.drawHighlightRect) == "function" and not ui.view._zotero_region_draw_adapter then
         local draw = ui.view.drawHighlightRect
@@ -599,6 +575,8 @@ function Annotations.applyToReader(api, ui, config, key)
     if not ui.annotation or type(ui.annotation.annotations) ~= "table" then
         return nil, "Reader annotations are not initialized"
     end
+    -- Protect even a PDF with no cache, an invalid cache or no cloud items.
+    Annotations.protectReader(api, ui, key)
     local identity, user_id = local_identity(api, key), current_user(api)
     local has_imports = false
     for _, item in ipairs(ui.annotation.annotations) do
