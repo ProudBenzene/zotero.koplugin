@@ -46,8 +46,9 @@ end
 
 local function target(ui, value)
     if type(value) == "number" then return ui.annotation.annotations[value] end
-    if type(value) == "table" and ui.bookmark and ui.bookmark.getBookmarkItemIndex then
-        local index = ui.bookmark:getBookmarkItemIndex(value)
+    if type(value) == "table" and ui.annotation.getItemIndex then
+        -- A filtered menu row's idx belongs to the visible list, not annotations.
+        local index = ui.annotation:getItemIndex(value)
         return ui.annotation.annotations[index] or value
     end
     return value
@@ -87,6 +88,8 @@ local function readonly_view(state, ui, item, value)
     if bookmark and bookmark.showBookmarkDetails and index then
         local function navigate(i)
             close()
+            -- Native details need the target row's idx from the displayed menu page.
+            if menu then bookmark:updateBookmarkList(nil, i) end
             bookmark:showBookmarkDetails(menu and items[i] or i)
         end
         buttons[#buttons + 1] = {
@@ -341,6 +344,14 @@ function Policy.install(ui, is_imported, text)
             end
         end)
     end
+    hook(state, ui.bookmark, "getBookmarkItemIndex", function(original)
+        return function(reader, item)
+            -- Native bookmark edits/removals also need the source index. Its
+            -- fast path overlooks color filtering and trusts the display idx.
+            if reader.show_color_only then return ui.annotation:getItemIndex(item) end
+            return original(reader, item)
+        end
+    end)
     for __, name in ipairs({ "removeItem", "removeItemByIndex", "deleteItemNote", "setBookmarkNote", "editHighlightedText", "setHighlightedText" }) do
         hook(state, ui.bookmark, name, function(original)
             return function(reader, value, ...)

@@ -44,6 +44,7 @@ local ok, err = xpcall(function()
     package.loaded["document/documentregistry"] = { getReferenceCount = function() return 1 end }
     package.loaded["ui/translator"] = { genSettingsMenu = function() return {} end }
     package.loaded["ui/event"] = { new = function(_, name, ...) return { name = name, args = {...} } end }
+    package.loaded["ui/widget/textboxwidget"] = { PTF_BOLD_START = "", PTF_BOLD_END = "", PTF_HEADER = "" }
     package.loaded.docsettings = { getSidecarDir = function(_, path) return path .. ".sdr" end }
     local util = require("util")
     util.tableDeepCopy, util.cleanupSelectedText = copy, function(value) return value end
@@ -69,15 +70,25 @@ local ok, err = xpcall(function()
     local Menu = require("ui/widget/menu")
     Menu.getItemFontSize = function() return 16 end
     Menu.setTitleBarLeftIcon = function(self, value) self.left_icon = value end
-    Menu.switchItemTable = function(self, title, items)
+    local menu_init = Menu.init
+    Menu.init = function(self)
+        menu_init(self)
+        self.perpage = self.items_per_page or 10
+    end
+    Menu.switchItemTable = function(self, title, items, itemnumber)
         self.title, self.item_table = title or self.title, items or self.item_table
+        if itemnumber == nil then self.page = 1
+        elseif itemnumber >= 0 then self.page = math.max(1, math.ceil(math.min(itemnumber, #self.item_table) / self.perpage)) end
+        -- Native Menu:updateItems assigns idx only to rows on the displayed page.
+        local first = (self.page - 1) * self.perpage + 1
+        for i = first, math.min(first + self.perpage - 1, #self.item_table) do self.item_table[i].idx = i end
     end
     Menu.perpage = 10
     package.loaded["ui/bidi"] = {
         mirroredUILayout = function() return false end,
         ltr = function(value) return value end,
         flipDirectionIfMirroredUILayout = function(value) return value end,
-        getArrowLabels = function() return "First", "Previous", "Next", "Last" end,
+        getArrowLabels = function() return "Previous", "Next", "First", "Last" end,
     }
     local function load(name)
         local file = source .. "/" .. name .. ".lua"
@@ -94,6 +105,7 @@ local ok, err = xpcall(function()
     local ReaderBookmark = load("apps/reader/modules/readerbookmark")
     local PdfDocument = load("document/pdfdocument")
     local original_save, original_delete = PdfDocument.saveHighlight, ReaderHighlight.deleteHighlight
+    local original_bookmark_index = ReaderBookmark.getBookmarkItemIndex
     local plugin = support.plugin()
     local attachment = support.attachment("ATTACH01", "paper.pdf", false)
     attachment.data.md5 = string.rep("0", 32)
@@ -165,6 +177,134 @@ local ok, err = xpcall(function()
         if item.zotero_source and item.zotero_source.annotation_key == "ANNOT001" then cloud, cloud_index = item, i end
     end
     local pos0, pos1, count = cloud.pos0, cloud.pos1, #ui.annotation.annotations
+    do
+        local original_items = ui.annotation.annotations
+        for _, cloud_count in ipairs({10, 20}) do
+            local paged_items = {}
+            for i = 1, cloud_count do
+                local item = copy(cloud)
+                item.zotero_source.annotation_key = string.format("NAV%05d", i)
+                item.zotero_source.sort_index = string.format("%05d", i)
+                paged_items[i] = item
+            end
+            local paged_local = copy(local_item)
+            paged_local.color = "blue"
+            local local_index = cloud_count + 1
+            paged_items[local_index], paged_items[local_index + 1] = paged_local, copy(dogear)
+            ui.annotation.annotations = paged_items
+            Annotations.reindex(ui)
+            for _, color_filter in ipairs({false, true}) do
+                ui.bookmark:onShowBookmark()
+                if color_filter then
+                    ui.bookmark:filterByHighlightColor()
+                    last().callback("blue")
+                end
+                local paged_list = ui.bookmark.bookmark_menu[1]
+                check(paged_list.page == 1 and paged_list.item_table[11].idx == nil
+                    and paged_list.item_table[local_index].idx == nil, "Unvisited menu pages have no row indices")
+                ui.bookmark:showBookmarkDetails(paged_list.item_table[10])
+                for i = 11, local_index do
+                    button(last(), "▶").callback()
+                    if i == 11 and cloud_count > 10 then
+                        check(paged_list.page == 2 and paged_list.item_table[i].idx == i
+                            and last().title == "Zotero Annotation · Blue", "Cloud-to-cloud navigation renders the next menu page")
+                    end
+                end
+                check(paged_list.page == math.ceil(local_index / 10) and paged_list.item_table[local_index].idx == local_index
+                    and last().text:find("Local text", 1, true) and button(last(), "Edit text").enabled,
+                    "Cloud-to-local navigation across menu pages opens editable native details")
+                button(last(), "Previous").callback()
+                check(paged_list.page == cloud_count / 10 and last().title == "Zotero Annotation · Blue",
+                    "Native local-to-cloud navigation returns to the correct menu page")
+                paged_list.close_callback()
+            end
+        end
+        ui.annotation.annotations = original_items
+        Annotations.reindex(ui)
+        globals.bookmarks_items_per_page, globals.bookmarks_items_reverse_sorting = 2, true
+        ui.bookmark:onShowBookmark()
+        local reversed_list = ui.bookmark.bookmark_menu[1]
+        check(reversed_list.page == 2 and reversed_list.item_table[2].idx == nil,
+            "Reverse navigation starts with an unvisited previous menu page")
+        ui.bookmark:showBookmarkDetails(reversed_list.item_table[3])
+        button(last(), "◀").callback()
+        check(reversed_list.page == 1 and reversed_list.item_table[2].idx == 2
+            and last().text:find("Local text", 1, true) and button(last(), "Edit text").enabled,
+            "Cloud-to-local navigation also renders the previous menu page")
+        reversed_list.close_callback()
+        globals.bookmarks_items_per_page, globals.bookmarks_items_reverse_sorting = 10, nil
+        ui.bookmark:showBookmarkDetails(cloud_index)
+        button(last(), "▶").callback()
+        button(last(), "▶").callback()
+        check(not ui.bookmark.bookmark_menu and last().text:find("Local text", 1, true)
+            and button(last(), "Edit text").enabled, "Reader-only detail navigation works without a bookmark menu")
+        last().close_callback()
+    end
+    local function filtered_list(color)
+        ui.bookmark:onShowBookmark()
+        ui.bookmark:filterByHighlightColor()
+        last().callback(color)
+        return ui.bookmark.bookmark_menu[1]
+    end
+    local filtered = filtered_list("gray")
+    local row = filtered.item_table[1]
+    local local_source_index = ui.annotation:getItemIndex(local_item)
+    check(#filtered.item_table == 1 and row.idx == 1 and local_source_index ~= row.idx,
+        "Color filtering renumbers a local row independently of its annotation index")
+    ui.bookmark:showBookmarkDetails(row)
+    check(last().text:find("Local text", 1, true) and button(last(), "Edit text").enabled,
+        "A color-filtered local row opens its editable native details")
+    check(ui.bookmark:getBookmarkItemIndex(row) == local_source_index,
+        "Native bookmark operations resolve the filtered row by annotation identity")
+    button(last(), "Edit text").callback()
+    local input = last(); input.input = "Filtered local text"; button(input, "Save").callback()
+    check(local_item.text == "Filtered local text" and cloud.text == "Cloud text",
+        "Editing filtered local text updates only the selected annotation")
+    button(last(), "Edit note").callback()
+    input = last(); input.input = "Filtered local note"; button(input, "Save").callback()
+    check(local_item.note == "Filtered local note" and cloud.note == "Cloud comment",
+        "Editing a filtered local note updates only the selected annotation")
+    last().close_callback()
+    filtered:toggleSelectMode(); row.dim = true; filtered.select_count = 1
+    filtered:onLeftButtonTap(); button(last(), "Delete note").callback(); last().ok_callback()
+    check(local_item.note == nil and cloud.note == "Cloud comment" and last().text:find("updated: 1", 1, true)
+        and last().text:find("skipped: 0", 1, true), "Filtered bulk note deletion updates the local note without skipping it")
+    filtered.close_callback()
+
+    local disposable = { page = 1, pos0 = {page = 1, x = 7, y = 7}, pos1 = {page = 1, x = 8, y = 8},
+        drawer = "lighten", color = "red", text = "Disposable local text", datetime = "2026-10-07 12:00:00" }
+    ui.annotation:addItem(disposable)
+    filtered = filtered_list("red")
+    row = filtered.item_table[1]
+    check(#filtered.item_table == 1 and row.idx ~= ui.annotation:getItemIndex(disposable),
+        "The filtered removal fixture has different display and source indices")
+    filtered:toggleSelectMode(); row.dim = true; filtered.select_count = 1
+    filtered:onLeftButtonTap(); button(last(), "Remove").callback(); last().ok_callback()
+    check(#ui.annotation.annotations == count and not ui.annotation:getItemIndex(disposable)
+        and ui.annotation.annotations[cloud_index] == cloud and ui.annotation:getItemIndex(local_item)
+        and #filtered.item_table == 0, "Filtered bulk removal deletes only the selected local annotation")
+    filtered.close_callback()
+
+    globals.bookmarks_items_reverse_sorting = true
+    filtered = filtered_list("blue")
+    for _, candidate in ipairs(filtered.item_table) do
+        if candidate.zotero_source.annotation_key == "ANNOT001" then row = candidate end
+    end
+    check(row.idx ~= cloud_index and #filtered.item_table == 2, "Reversed color filtering also renumbers cloud rows")
+    ui.bookmark:showBookmarkDetails(row)
+    check(last().title == "Zotero Annotation · Blue" and last().text:find("Cloud text", 1, true),
+        "A reversed color-filtered cloud row keeps the correct read-only details")
+    ui.bookmark:setHighlightedText(row, "Changed through filtered row", function() end)
+    check(cloud.text == "Cloud text" and local_item.text == "Filtered local text",
+        "Reversed color-filtered cloud editing is blocked without changing a local annotation")
+    filtered:toggleSelectMode()
+    for _, item in ipairs(filtered.item_table) do item.dim = true end
+    filtered.select_count = #filtered.item_table
+    filtered:onLeftButtonTap(); button(last(), "Remove").callback(); last().ok_callback()
+    check(#ui.annotation.annotations == count and #filtered.item_table == 2 and last().text:find("skipped: 2", 1, true),
+        "Reversed color-filtered bulk removal preserves all cloud annotations")
+    filtered.close_callback()
+    globals.bookmarks_items_reverse_sorting = nil
     for _, name in ipairs({"deleteHighlight", "editNote", "editHighlightStyle", "editHighlightColor", "updateHighlight", "startSelection"}) do
         ui.highlight[name](ui.highlight, cloud_index)
         check(#ui.annotation.annotations == count and cloud.pos0 == pos0 and cloud.pos1 == pos1, "Block native " .. name)
@@ -276,7 +416,8 @@ local ok, err = xpcall(function()
     for _, item in ipairs(ui.annotation.annotations) do if item.zotero_source then updated = item end end
     check(updated.text == "Changed remotely", "Cloud changes remain authoritative")
     check(native_writes == 0 and native_pages == 0 and support.read(path) == "unchanged PDF bytes" and #support.requests == 0, "Local and cloud changes never write PDF or make network requests")
-    check(PdfDocument.saveHighlight == original_save and ReaderHighlight.deleteHighlight == original_delete, "Native classes are unchanged")
+    check(PdfDocument.saveHighlight == original_save and ReaderHighlight.deleteHighlight == original_delete
+        and ReaderBookmark.getBookmarkItemIndex == original_bookmark_index, "Native classes are unchanged")
     local ordinary = PdfDocument:extend{file = directory .. "/ordinary.pdf", _document = ui.document._document}
     support.write(ordinary.file, "ordinary PDF bytes")
     check(ordinary:_checkIfWritable() == true, "An ordinary PDF keeps native writability")
@@ -286,6 +427,8 @@ local ok, err = xpcall(function()
     ui.document.file = ordinary.file
     plugin:prepareAnnotationImport(config, ui.document)
     check(not ui.document._zotero_policy and ui.document.writeDocument == PdfDocument.writeDocument, "Unmanaged path restores instance methods")
+    check(ui.bookmark.getBookmarkItemIndex == original_bookmark_index and rawget(ui.bookmark, "getBookmarkItemIndex") == nil,
+        "Unmanaged path restores the native bookmark index resolver")
 end, debug.traceback)
 support.teardown()
 if not ok then error(err) end
