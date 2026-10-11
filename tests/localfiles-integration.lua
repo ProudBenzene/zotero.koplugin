@@ -1,24 +1,27 @@
--- Run the actual KOReader v2026.03 DocSettings open/purge code on real files.
+-- Run actual KOReader DocSettings open/purge code on real PDF/EPUB stand-ins.
 -- Hash calculation, directory enumeration and UI/history are test doubles.
 -- Usage: pandoc lua tests/localfiles-integration.lua /path/to/frontend/docsettings.lua
 package.path = "./?.lua;./tests/?.lua;" .. package.path
-local source = assert(arg[1], "Supply KOReader v2026.03 frontend/docsettings.lua")
+local source = assert(arg[1], "Supply KOReader frontend/docsettings.lua")
 local support = require("tests/support")
 local LocalFiles = require("localfiles")
+local Cleanup = require("downloadcleanup")
 local checks = 0
 local function check(value, label)
     assert(value, label)
     checks = checks + 1
 end
 
+for _, extension in ipairs({"pdf","epub"}) do
 for _, location in ipairs({"doc","dir","hash"}) do
     local API = support.setup()
     local ok, err = xpcall(function()
-        local item = support.attachment("ATTACH01","paper.pdf",false)
+        local item = support.attachment("ATTACH01","paper."..extension,false)
+        if extension=="epub" then item.data.contentType="application/epub+zip" end
         support.seed({ATTACH01=item})
         local directory,path = API.getDirAndPath(item.key)
         assert(support.makePath(directory))
-        support.write(path,"PDF stand-in")
+        support.write(path,"document stand-in")
         support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=10}))
         support.write(directory.."/.zotero-annotations.json","annotation cache")
         local storage = require("datastorage")
@@ -40,7 +43,7 @@ for _, location in ipairs({"doc","dir","hash"}) do
         local hash_calls = 0
         local hash = string.rep("a",32)
         util.partialMD5 = function(file)
-            check(support.read(file)=="PDF stand-in","Hash sidecar located before PDF removal")
+            check(support.read(file)=="document stand-in","Hash sidecar located before document removal")
             hash_calls = hash_calls+1
             return hash
         end
@@ -50,6 +53,7 @@ for _, location in ipairs({"doc","dir","hash"}) do
         end}
         local lfs = require("libs/libkoreader-lfs")
         local attributes = lfs.attributes
+        local directory_iterator = lfs.dir
         lfs.attributes = function(file,field)
             local attr = attributes(file)
             if attr then attr.modification=100 end
@@ -73,30 +77,43 @@ for _, location in ipairs({"doc","dir","hash"}) do
         local DocSettings = dofile(source)
         package.loaded.docsettings = DocSettings
         local sdrs = {doc=directory.."/paper.sdr",dir=central..directory.."/paper.sdr",hash=hashed.."/aa/"..hash..".sdr"}
-        local page_cache = support.directory.."/page.cache"
+        local page_cache = support.directory.."/cache/page.cache"
         local content = 'return {annotations={{text="local annotation"}},bookmarks={1},last_page=3,cache_file_path="'
             .. page_cache .. '"}'
         for _,dir in pairs(sdrs) do
-            write(dir.."/metadata.pdf.lua",content)
-            write(dir.."/metadata.pdf.lua.old",content)
+            write(dir.."/metadata."..extension..".lua",content)
+            write(dir.."/metadata."..extension..".lua.old",content)
         end
-        write(sdrs.doc.."/paper.pdf.lua",content)
+        write(sdrs.doc.."/paper."..extension..".lua",content)
         write(DocSettings:getHistoryPath(path),content)
         write(DocSettings:getHistoryPath(path)..".old",content)
         write(path..".kpdfview.lua",content)
         write(sdrs[location].."/cover.png","cover")
         write(sdrs[location].."/custom_metadata.lua","custom")
         write(page_cache,"page cache")
-        local deleted,cleanup_err = LocalFiles.removePDF(API,item.key,path)
+        local deleted,cleanup_err
+        if extension=="pdf" then
+            deleted,cleanup_err = LocalFiles.removePDF(API,item.key,path)
+        else
+            lfs.dir = directory_iterator
+            local scan=Cleanup.scanDownloads(API)
+            check(#scan.targets==1 and scan.epub==1,"Native EPUB found for batch cleanup")
+            local stats=Cleanup.newStats(scan)
+            Cleanup.processTarget(scan.targets[1],stats)
+            deleted=stats.deleted==1 and stats.failed==0 and stats.pending==0
+            cleanup_err=stats.errors[1] and stats.errors[1].message
+        end
         check(deleted and not cleanup_err,"Native settings cleanup succeeds in "..location)
-        check(not lfs.attributes(path),"PDF removed")
+        check(not lfs.attributes(path),"Document removed")
         check(hash_calls==1,"Hash storage discovered once before unlink")
         for file in pairs(files) do check(not lfs.attributes(file),"Removed "..file) end
         check(not lfs.attributes(directory.."/.zotero-annotations.json"),"Cloud annotation cache removed")
         check(API.getItems().ATTACH01 and #support.requests==0,"Cloud metadata kept, no HTTP")
         lfs.attributes = attributes
+        lfs.dir = directory_iterator
     end,debug.traceback)
     support.teardown()
     if not ok then error(err) end
+end
 end
 io.write(string.format("%d native DocSettings removal checks passed\n",checks))

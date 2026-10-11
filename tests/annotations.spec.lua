@@ -646,7 +646,7 @@ describe("One-way Zotero PDF annotations",function()
         browser:refreshAnnotations({key="ATTACH01"});assert(#support.UI.scheduled==1)
         attachment.data.contentType="application/epub+zip"
         browser:onMenuHold({key="ATTACH01",file_type="EPUB"})
-        assert(#support.UI.shown[#support.UI.shown].buttons_table==1)
+        assert(#support.UI.shown[#support.UI.shown].buttons_table==2)
     end)
 
     it("loads managed PDFs through reader events without HTTP and disables embedded writing per file",function()
@@ -723,17 +723,74 @@ describe("One-way Zotero PDF annotations",function()
         assert(support.UI.shown[#support.UI.shown].text:find("PDF annotations were not updated",1,true))
     end)
 
-    it("adds forced annotation refresh to Maintenance and reports partial success",function()
+    it("fully resyncs the library and refetches every downloaded PDF even when annotation versions match",function()
+        local plugin=support.plugin()
+        local second=support.attachment("ATTACH02","other.pdf",false)
+        second.data.md5=MD5
+        local first_remote=annotation()
+        local second_remote=annotation("ANNOT002",10,{parent="ATTACH02",text="Other cloud text"})
+        support.seed({ATTACH01=attachment,ATTACH02=second,
+            ANNOT001={key="ANNOT001",version=10,data={itemType="annotation",parentItem="ATTACH01"}},
+            ANNOT002={key="ANNOT002",version=10,data={itemType="annotation",parentItem="ATTACH02"}}},{},10)
+        cache({annotation(nil,10,{text="Incorrect cached text"})})
+        local second_directory,second_path=API.getDirAndPath("ATTACH02")
+        assert(support.makePath(second_directory))
+        support.write(second_path,"hello")
+        support.write(second_directory.."/.zotero-cache.json",support.JSON.encode({version=10,md5=MD5}))
+        local second_cache=snapshot({annotation("ANNOT002",10,{parent="ATTACH02",text="Incorrect other cache"})})
+        second_cache.attachment_key="ATTACH02"
+        support.write(second_directory.."/.zotero-annotations.json",support.JSON.encode(second_cache))
+        local stats=Annotations.refreshDownloaded(API)
+        assert(stats.unchanged==2 and #support.requests==0)
+        local fetched={}
+        support.response=function(req)
+            assert(req.method=="GET")
+            if req.url:find("/keys/current",1,true) then return support.key(req) end
+            if req.url:find("/items?",1,true) then
+                assert(req.url:find("since=0",1,true) and not req.headers["If-Modified-Since-Version"])
+                return support.respond(req,{attachment,second,first_remote,second_remote},10)
+            end
+            if req.url:find("/collections?",1,true) then
+                assert(req.url:find("since=0",1,true))
+                return support.respond(req,{},10)
+            end
+            for key,remote in pairs({ATTACH01=first_remote,ATTACH02=second_remote}) do
+                if req.url:find("/"..key.."/children?",1,true) then
+                    fetched[key]=(fetched[key] or 0)+1
+                    return support.respond(req,{remote},10)
+                end
+                if req.url:match("/"..key.."$") then
+                    return support.respond(req,key=="ATTACH01" and attachment or second)
+                end
+            end
+            error("Unexpected full resync request "..req.url)
+        end
+        local menus={};plugin:addToMainMenu(menus)
+        menus.zotero.sub_item_table[3].sub_item_table[1].callback()
+        support.UI.scheduled[1]()
+        assert(fetched.ATTACH01==1 and fetched.ATTACH02==1)
+        assert(Annotations.readCache(API,"ATTACH01").items[1].data.annotationText=="Selected text")
+        assert(Annotations.readCache(API,"ATTACH02").items[1].data.annotationText=="Other cloud text")
+        assert(API.getLibraryVersion()==10 and not API.settings:isTrue("force_full_sync"))
+        assert(support.read(path)=="hello" and support.read(second_path)=="hello")
+        local message=support.UI.shown[#support.UI.shown]
+        assert(message.icon=="check" and message.text:find("cached: 2; unchanged: 0; failed: 0",1,true))
+    end)
+
+    it("forces annotation refresh from both Maintenance actions and preserves caches on failure",function()
         cache({annotation()})
         local plugin=support.plugin()
         local menus={};plugin:addToMainMenu(menus)
         API.syncAllItems=function() end
-        API.fetchAttachmentAnnotations=function() return nil,"offline" end
-        menus.zotero.sub_item_table[3].sub_item_table[2].callback()
-        support.UI.scheduled[1]()
-        local message=support.UI.shown[#support.UI.shown]
-        assert(message.icon=="notice-warning" and message.text:find("failed: 1",1,true))
-        assert(Annotations.readCache(API,"ATTACH01") and not plugin.syncing)
+        local fetched=0
+        API.fetchAttachmentAnnotations=function() fetched=fetched+1;return nil,"offline" end
+        for index=1,2 do
+            menus.zotero.sub_item_table[3].sub_item_table[index].callback()
+            support.UI.scheduled[index]()
+            local message=support.UI.shown[#support.UI.shown]
+            assert(fetched==index and message.icon=="notice-warning" and message.text:find("failed: 1",1,true))
+            assert(Annotations.readCache(API,"ATTACH01") and not plugin.syncing)
+        end
     end)
 
     it("updates only the cache while a PDF is being read and applies it on the next load",function()

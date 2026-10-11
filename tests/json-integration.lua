@@ -48,6 +48,37 @@ local ok, err = xpcall(function()
     check(not result and fetch_err and support.read(directory.."/.zotero-annotations.json")==saved,
         "Object response does not clear the cache")
     check(support.read(path)=="immutable stand-in", "PDF stand-in is unchanged")
+    local Cleanup=require("downloadcleanup")
+    local state=pandoc.json.decode(support.read(API.cache_path))
+    state.compact=nil
+    state.items.ATTACH01.data.parentItem="PARENT01"
+    state.items.ATTACH01.data.title="Full Text PDF"
+    state.items.PARENT01={data={itemType="journalArticle",title='中文 "title"\nOriginal title',unused=string.rep("x",1048576)}}
+    support.write(API.cache_path,pandoc.json.encode(state))
+    local library=support.read(API.cache_path)
+    API.state=nil
+    local scan=Cleanup.scanDownloads(API)
+    check(#scan.targets==1 and scan.pdf==1,"Real JSON receipts identify a downloaded PDF")
+    check(scan.targets[1].title==state.items.PARENT01.data.title and scan.targets[1].attachment_title=="Full Text PDF",
+        "Streaming cold metadata retains Unicode document and attachment titles for preview")
+    check(API.state==nil and support.read(API.cache_path)==library,"Preview scan leaves large legacy metadata unchanged")
+    local requests=#support.requests
+    local original=os.remove
+    os.remove=function(file)
+        if file==directory.."/.zotero-annotations.json" then return nil,"denied" end
+        return original(file)
+    end
+    local stats=Cleanup.newStats(scan)
+    Cleanup.processTarget(scan.targets[1],stats)
+    check(stats.deleted==1 and stats.pending==1,"Cleanup failure preserves a retry record after unlink")
+    os.remove=original
+    local task=pandoc.json.decode(support.read(directory.."/.zotero-cleanup.json"))
+    check(task.source=="zotero.koplugin" and task.tasks["paper.pdf"].identity.size==#"immutable stand-in",
+        "Cleanup task round trips with real JSON")
+    scan=Cleanup.scanDownloads(API);stats=Cleanup.newStats(scan)
+    Cleanup.processTarget(scan.targets[1],stats)
+    check(stats.cleaned==1 and stats.failed==0 and stats.pending==0,"Real JSON cleanup task retries successfully")
+    check(#support.requests==requests and support.read(API.cache_path)==library,"Cleanup keeps library bytes and performs no HTTP")
 end,debug.traceback)
 support.teardown()
 if not ok then error(err) end

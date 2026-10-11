@@ -94,6 +94,22 @@ function lfs.attributes(path, field)
 end
 function lfs.mkdir(path) return Support.makePath(path) end
 function lfs.touch(path, access, modification) Support.last_touch = {path, access, modification}; return true end
+function lfs.symlinkattributes(path, field)
+    if not path then return nil end
+    local attr = Support.execute("test -L " .. Support.quote(path)) and {mode="link"} or lfs.attributes(path)
+    return field and attr and attr[field] or (not field and attr or nil)
+end
+function lfs.dir(path)
+    local script = "import os,sys; print('\\n'.join(os.fsencode(n).hex() for n in os.listdir(sys.argv[1])))"
+    local pipe = assert(io.popen("python3 -c " .. Support.quote(script) .. " " .. Support.quote(path)))
+    local names = {}
+    for line in pipe:lines() do
+        if line ~= "" then names[#names+1] = line:gsub("%x%x",function(byte) return string.char(tonumber(byte,16)) end) end
+    end
+    assert(pipe:close())
+    local index=0
+    return function() index=index+1;return names[index] end
+end
 
 local function base64(input)
     local alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -221,7 +237,9 @@ local modules = {
     ["ui/widget/infomessage"]=InfoMessage, ["ui/widget/inputdialog"]=Widget, ["ui/uimanager"]=UI,
     ["ui/time"]={now=function() return Support.clock*1000000 end, s=function(seconds) return seconds*1000000 end},
     ["ui/widget/container/widgetcontainer"]=Widget, ["ui/widget/spinwidget"]=Widget,
-    ["datastorage"]={getDataDir=function() return Support.directory end},
+    ["datastorage"]={getDataDir=function() return Support.directory end,
+        getDocSettingsDir=function() return Support.directory.."/docsettings" end,
+        getDocSettingsHashDir=function() return Support.directory.."/hashdocsettings" end},
     ["ui/widget/container/framecontainer"]=Widget, ["device"]={screen={getWidth=function() return 600 end,
         getHeight=function() return 800 end,scaleBySize=function(_, value) return value end}},
     ["ui/font"]={getFace=function() return {} end}, ["ui/widget/menu"]=Menu,
@@ -230,10 +248,19 @@ local modules = {
     ["ui/widget/confirmbox"]=Widget,
     ["ui/widget/multiinputdialog"]=Widget,
     ["apps/reader/readerui"]={showReader=function(_, path) Support.opened_path=path end},
-    ["docsettings"]={open=function(_, path)
+    ["docsettings"]={getSidecarDir=function(_,path,location)
+            local stem=path:match("^(.*)%.") or path
+            return (location=="dir" and Support.directory.."/docsettings" or "")..stem..".sdr"
+        end,
+        getSidecarFilename=function(path) return "metadata."..(path:match("%.([^%.]+)$") or "_")..".lua" end,
+        getHistoryPath=function(_,path) return Support.directory.."/history/["..path:gsub("/","#").."].lua" end,
+        open=function(_, path)
         Support.settings_opened_path=path
         local data=Support.doc_settings[path] or {}
         local instance={data=data.data or {},candidates=data.candidates,
+            doc_sidecar_dir=(path:match("^(.*)%.") or path)..".sdr",
+            dir_sidecar_dir=Support.directory.."/docsettings"..(path:match("^(.*)%.") or path)..".sdr",
+            hash_sidecar_dir=data.hash_sidecar_dir,
             readSetting=function(self, key) return self.data[key] end,
             getCustomCoverFile=function() return data.cover end,
             getCustomMetadataFile=function() return data.metadata end,
@@ -267,7 +294,7 @@ function Support.setup()
     UI.dirty, UI.paints, Support.clock = {}, {}, 0
     Support.GetText.current_lang="C"
     local temporary_root=os.getenv("TMPDIR") or "/tmp"
-    Support.directory=temporary_root.."/zotero-tests-"..tostring(original_time()).."-"..tostring({}):gsub("[^%w]","")
+    Support.directory=temporary_root:gsub("/+$","").."/zotero-tests-"..tostring(original_time()).."-"..tostring({}):gsub("[^%w]","")
     assert(Support.makePath(Support.directory))
     package.loaded.zoteroapi=nil
     package.loaded.progressdialog=nil

@@ -367,6 +367,27 @@ describe("Zotero API offline regressions", function()
         assert(API.getAttachmentStatus("MISSING1")=="not_downloaded")
     end)
 
+    it("enriches a verified legacy download receipt with ownership without downloading again",function()
+        local directory,path,item=cached_attachment("imported_file",HELLO_MD5)
+        support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=item.version,md5=HELLO_MD5}))
+        assert(API.downloadAndGetPath(item.key)==path and #support.requests==0)
+        local receipt=support.JSON.decode(support.read(directory.."/.zotero-cache.json"))
+        assert(receipt.format==1 and receipt.source=="zotero.koplugin" and receipt.user_id=="123"
+            and receipt.attachment_key==item.key and receipt.filename=="paper.pdf" and receipt.content_type=="application/pdf")
+    end)
+
+    it("keeps previous filenames in download receipts so renamed local copies remain identifiable",function()
+        local directory,path,item=cached_attachment("imported_file",HELLO_MD5)
+        support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=item.version,md5=HELLO_MD5}))
+        assert(API.downloadAndGetPath(item.key)==path)
+        item.data.filename="renamed.pdf"
+        support.response=function(req) return support.respond(req,"hello") end
+        assert(API.downloadAndGetPath(item.key)==directory.."/renamed.pdf")
+        local receipt=support.JSON.decode(support.read(directory.."/.zotero-cache.json"))
+        assert(receipt.filename=="renamed.pdf" and #receipt.previous_files==1 and receipt.previous_files[1].filename=="paper.pdf")
+        assert(support.read(path)=="old PDF")
+    end)
+
     it("does not use a sibling's cached version to skip a changed file", function()
         local directory,path=cached_attachment()
         local item=support.attachment("ATTACH02","other.pdf","PARENT01",30)

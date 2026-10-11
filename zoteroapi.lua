@@ -228,6 +228,18 @@ end
 function API.getAPIKey() return API.settings:readSetting("api_key") end
 function API.getUserID() return API.settings:readSetting("user_id") end
 
+-- Shared by all FileManager/Reader plugin instances, including queued jobs.
+function API.beginOperation(name)
+    if API.operation then return nil end
+    local token = { name = name }
+    API.operation = token
+    return token
+end
+function API.endOperation(token)
+    if API.operation == token then API.operation = nil end
+end
+function API.isBusy() return API.operation ~= nil end
+
 function API.setAPIKey(api_key)
     api_key = trim(api_key)
     if API.getAPIKey() ~= api_key then API.state = nil end
@@ -886,7 +898,37 @@ local function download_attachment(key, download_callback, progress_callback)
     if not ok then return nil, "Could not create attachment directory: " .. tostring(err) end
     local metadata_path = target_dir .. "/.zotero-cache.json"
     local md5 = attachment_md5(attachment)
+    local previous_receipt = read_json(metadata_path)
+    local function receipt()
+        local result = { format = 1, source = "zotero.koplugin", user_id = user_id, attachment_key = key,
+            filename = attachment.data.filename, content_type = attachment.data.contentType,
+            version = attachment.version, md5 = md5 }
+        if previous_receipt and previous_receipt.format == 1 and previous_receipt.source == "zotero.koplugin"
+            and previous_receipt.user_id == user_id and previous_receipt.attachment_key == key then
+            local seen, files = {}, {}
+            local function remember(previous)
+                local name = type(previous) == "table" and previous.filename
+                if type(name) == "string" and name ~= "" and name ~= "." and name ~= ".."
+                    and not name:find("[/\\%z]") and not name:match("^%.zotero%-")
+                    and name ~= attachment.data.filename and not seen[name] and SUPPORTED_MEDIA_TYPES[previous.content_type] then
+                    files[#files + 1] = { filename = name, content_type = previous.content_type }; seen[name] = true
+                end
+            end
+            for _, previous in ipairs(type(previous_receipt.previous_files) == "table" and previous_receipt.previous_files or {}) do remember(previous) end
+            remember(previous_receipt)
+            if #files > 0 then result.previous_files = files end
+        end
+        return result
+    end
     if attachment_status(attachment, target_dir, target_path) == "downloaded" then
+        local previous = previous_receipt
+        if not previous or previous.format ~= 1 or previous.source ~= "zotero.koplugin" or previous.user_id ~= user_id
+            or previous.attachment_key ~= key or previous.filename ~= attachment.data.filename
+            or previous.content_type ~= attachment.data.contentType then
+            -- Enrich a valid legacy receipt without requiring a network request.
+            local saved, save_err = write_json(metadata_path, receipt())
+            if not saved then return nil, "Could not save attachment metadata: " .. tostring(save_err) end
+        end
         report_progress(progress_callback, "cached")
         return target_path
     end
@@ -936,7 +978,7 @@ local function download_attachment(key, download_callback, progress_callback)
     if not ok then os.remove(temporary); return nil, "Could not save attachment: " .. tostring(err) end
     local mtime = tonumber(attachment.data.mtime)
     if mtime then lfs.touch(target_path, os.time(), mtime / 1000) end
-    ok, err = write_json(metadata_path, { version = attachment.version, md5 = md5 })
+    ok, err = write_json(metadata_path, receipt())
     if not ok then return nil, "Could not save attachment metadata: " .. tostring(err) end
     report_progress(progress_callback, "complete")
     return target_path
