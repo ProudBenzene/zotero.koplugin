@@ -351,4 +351,56 @@ describe("Zotero browser offline regressions",function()
         plugin.account_dialog.buttons[1][2].callback()
         assert(API.getUserID()=="123" and API.getAPIKey()=="FAKE-KEY")
     end)
+
+    it("keeps credentials on cancel or while busy and saves each account form once",function()
+        local original_save=API.saveSettings
+        for _,case in ipairs({
+            {open="setAccount",field="account_dialog",values={" 456 "," NEW-KEY "},getters={"getUserID","getAPIKey"},expected={"456","NEW-KEY"}},
+            {open="setWebdavAccount",field="webdav_account_dialog",values={" https://example.test/dav/ ","reader","secret"},
+                getters={"getWebDAVUrl","getWebDAVUser","getWebDAVPassword"},expected={"https://example.test/dav","reader","secret"}},
+        }) do
+            local previous,saved={},0
+            for i,getter in ipairs(case.getters) do previous[i]=API[getter]() end
+            API.saveSettings=function() saved=saved+1;original_save() end
+            plugin[case.open](plugin)
+            local dialog=plugin[case.field]
+            dialog.test_fields=case.values
+            dialog.buttons[1][1].callback()
+            for i,getter in ipairs(case.getters) do assert(API[getter]()==previous[i]) end
+            assert(saved==0 and support.UI.closed[#support.UI.closed]==dialog)
+
+            plugin[case.open](plugin)
+            dialog=plugin[case.field]
+            dialog.test_fields=case.values
+            local closed=0
+            dialog.onClose=function() closed=closed+1 end
+            local token=assert(API.beginOperation("sync"))
+            dialog.buttons[1][2].callback()
+            for i,getter in ipairs(case.getters) do assert(API[getter]()==previous[i]) end
+            assert(saved==0 and closed==0)
+            API.endOperation(token)
+            dialog.buttons[1][2].callback()
+            for i,getter in ipairs(case.getters) do assert(API[getter]()==case.expected[i]) end
+            assert(saved==1 and closed==1 and support.UI.closed[#support.UI.closed]==dialog)
+        end
+        API.saveSettings=original_save
+    end)
+
+    it("leaves a failed account update open and permits a successful retry",function()
+        plugin:setAccount()
+        local dialog=plugin.account_dialog
+        dialog.test_fields={"456","NEW-KEY"}
+        local original_set,original_save=API.setUserID,API.saveSettings
+        local closed,saved=0,0
+        dialog.onClose=function() closed=closed+1 end
+        API.setUserID=function() return nil,"storage unavailable" end
+        API.saveSettings=function() saved=saved+1;original_save() end
+        dialog.buttons[1][2].callback()
+        assert(API.getUserID()=="123" and API.getAPIKey()=="FAKE-KEY" and closed==0 and saved==0)
+        assert(support.UI.shown[#support.UI.shown].text:find("storage unavailable",1,true))
+        API.setUserID=original_set
+        dialog.buttons[1][2].callback()
+        assert(API.getUserID()=="456" and API.getAPIKey()=="NEW-KEY" and closed==1 and saved==1)
+        API.saveSettings=original_save
+    end)
 end)

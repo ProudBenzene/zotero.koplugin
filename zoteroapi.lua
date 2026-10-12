@@ -1,3 +1,4 @@
+local I18n = require("i18n")
 local BaseUtil = require("ffi/util")
 local LuaSettings = require("luasettings")
 local http = require("socket.http")
@@ -9,6 +10,7 @@ local lfs = require("libs/libkoreader-lfs")
 local sha2 = require("ffi/sha2")
 local util = require("util")
 local LibraryCache = require("librarycache")
+local FileUtil = require("fileutil")
 
 local API = {}
 local API_ROOT = "https://api.zotero.org"
@@ -28,47 +30,26 @@ local function file_exists(path)
     return path ~= nil and lfs.attributes(path, "mode") == "file"
 end
 
-local function file_slurp(path)
-    local f, err = io.open(path, "rb")
-    if not f then return nil, err end
-    local content = f:read("*a")
-    f:close()
-    return content
-end
-
-local function write_atomic(path, content)
-    local temporary = path .. ".tmp"
-    local f, err = io.open(temporary, "wb")
-    if not f then return nil, err end
-    local written, write_err = f:write(content)
-    local closed, close_err = f:close()
-    if not written or not closed then
-        os.remove(temporary)
-        return nil, write_err or close_err
-    end
-    local ok, rename_err = os.rename(temporary, path)
-    if not ok then os.remove(temporary) end
-    return ok, rename_err
-end
-
+local read_json = FileUtil.readJSON
 local function write_json(path, value)
-    local ok, content = pcall(JSON.encode, value)
-    if not ok then return nil, "Could not encode cache data" end
-    return write_atomic(path, content)
-end
-
-local function read_json(path)
-    local content, err = file_slurp(path)
-    if not content then return nil, err end
-    local ok, data = pcall(JSON.decode, content)
-    if not ok or type(data) ~= "table" then return nil, "Invalid JSON data" end
-    return data
+    return FileUtil.writeJSON(path, value, "Could not encode cache data")
 end
 
 local function copy_table(source)
     local target = {}
     for key, value in pairs(source) do target[key] = value end
     return target
+end
+
+local function deletion_keys(value)
+    if type(value) ~= "table" then return false end
+    local count = 0
+    for index, key in pairs(value) do
+        if type(index) ~= "number" or index < 1 or index % 1 ~= 0 or index > #value
+            or type(key) ~= "string" or not key:match("^[A-Z0-9]+$") then return false end
+        count = count + 1
+    end
+    return count == #value
 end
 
 -- Browsing/downloading needs only a small part of Zotero's full records. Keeping
@@ -555,7 +536,7 @@ local function sync_library(api_key, user_id, progress_callback)
                 deleted_version, err = response_version(deleted_headers)
                 if not err and deleted_version ~= version then err = LIBRARY_CHANGED end
                 if not err then
-                    if type(deleted.items) ~= "table" or type(deleted.collections) ~= "table" then
+                    if not deletion_keys(deleted.items) or not deletion_keys(deleted.collections) then
                         err = "Error: invalid deletion log in Zotero response"
                     else
                         for _, key in ipairs(deleted.items) do items[key] = nil end
@@ -626,8 +607,7 @@ function API.getDirAndPath(attachment_key)
     if not attachment or type(attachment.data) ~= "table" then return nil, nil, "Attachment not found" end
     local filename = attachment.data.filename
     if type(attachment_key) ~= "string" or not attachment_key:match("^[A-Z0-9]+$")
-        or type(filename) ~= "string" or filename == "" or filename == "." or filename == ".."
-        or filename:find("[/\\%z]") or filename:match("^%.zotero%-") then
+        or not FileUtil.validFilename(filename) then
         return nil, nil, "Invalid attachment key or filename"
     end
     local directory = BaseUtil.joinPath(API.storage_dir, attachment_key)
@@ -850,7 +830,7 @@ local function attachment_status(attachment, directory, path)
     end
     local metadata = read_json(directory .. "/.zotero-cache.json")
     local md5, version = attachment_md5(attachment), tonumber(attachment.version)
-    if metadata and ((md5 and metadata.md5 == md5)
+    if metadata and not metadata.download_pending and ((md5 and metadata.md5 == md5)
         or (not md5 and version and tonumber(metadata.version) == version)) then
         return "downloaded", path, attributes.size
     end
@@ -864,19 +844,48 @@ function API.getAttachmentStatus(key)
 end
 
 local function file_md5(path, progress_callback)
-    local f, err = io.open(path, "rb")
-    if not f then return nil, err end
-    local update = sha2.md5()
-    local checked = 0
-    while true do
-        local chunk = f:read(65536)
-        if not chunk then break end
-        update(chunk)
-        checked = checked + #chunk
-        report_progress(progress_callback, "verifying", { bytes = checked })
+    return FileUtil.md5(path, transfer_progress(progress_callback, "verifying"))
+end
+
+-- Match Cleanup.scanDownloads' legacy rules before replacing its only receipt.
+-- Include the current filename when counting candidates, then retain only old
+-- names. Capture once: publishing the new file can make a unique slot ambiguous.
+local function legacy_downloads(directory, filename, previous, progress_callback)
+    local files = {}
+    if not previous or previous.format ~= nil or previous.source ~= nil
+        or not (type(previous.version) == "number" and previous.version >= 0 and previous.version % 1 == 0
+            or type(previous.md5) == "string" and #previous.md5 == 32 and previous.md5:match("^%x+$")) then return files end
+    local real_directory = BaseUtil.realpath(directory)
+    local metadata_path = directory .. "/.zotero-cache.json"
+    if not real_directory or lfs.symlinkattributes(directory, "mode") == "link"
+        or lfs.symlinkattributes(metadata_path, "mode") ~= "file"
+        or BaseUtil.realpath(metadata_path) ~= real_directory .. "/.zotero-cache.json"
+        or (lfs.attributes(metadata_path, "size") or 0) > 1024 * 1024 then return files end
+    local candidates = {}
+    local ok, err = pcall(function()
+        for name in lfs.dir(directory) do
+            if FileUtil.validFilename(name) then
+                local suffix = name:lower():match("%.([^%.]+)$")
+                local content_type = suffix == "pdf" and "application/pdf" or suffix == "epub" and "application/epub+zip"
+                local path = directory .. "/" .. name
+                if content_type and lfs.symlinkattributes(path, "mode") == "file"
+                    and BaseUtil.realpath(path) == real_directory .. "/" .. name then
+                    candidates[#candidates + 1] = { filename = name, content_type = content_type }
+                end
+            end
+        end
+    end)
+    if not ok then return nil, err end
+    for _, candidate in ipairs(candidates) do
+        local matches = #candidates == 1
+        if not matches and type(previous.md5) == "string" then
+            local md5, hash_err = file_md5(directory .. "/" .. candidate.filename, progress_callback)
+            if not md5 then return nil, hash_err or "Could not verify previous download" end
+            matches = md5 == previous.md5:lower()
+        end
+        if matches and candidate.filename ~= filename then files[#files + 1] = candidate end
     end
-    f:close()
-    return update()
+    return files
 end
 
 local function download_attachment(key, download_callback, progress_callback)
@@ -899,6 +908,9 @@ local function download_attachment(key, download_callback, progress_callback)
     local metadata_path = target_dir .. "/.zotero-cache.json"
     local md5 = attachment_md5(attachment)
     local previous_receipt = read_json(metadata_path)
+    local legacy_files
+    legacy_files, err = legacy_downloads(target_dir, attachment.data.filename, previous_receipt, progress_callback)
+    if not legacy_files then return nil, "Could not save attachment metadata: " .. tostring(err) end
     local function receipt()
         local result = { format = 1, source = "zotero.koplugin", user_id = user_id, attachment_key = key,
             filename = attachment.data.filename, content_type = attachment.data.contentType,
@@ -908,8 +920,7 @@ local function download_attachment(key, download_callback, progress_callback)
             local seen, files = {}, {}
             local function remember(previous)
                 local name = type(previous) == "table" and previous.filename
-                if type(name) == "string" and name ~= "" and name ~= "." and name ~= ".."
-                    and not name:find("[/\\%z]") and not name:match("^%.zotero%-")
+                if FileUtil.validFilename(name)
                     and name ~= attachment.data.filename and not seen[name] and SUPPORTED_MEDIA_TYPES[previous.content_type] then
                     files[#files + 1] = { filename = name, content_type = previous.content_type }; seen[name] = true
                 end
@@ -917,6 +928,8 @@ local function download_attachment(key, download_callback, progress_callback)
             for _, previous in ipairs(type(previous_receipt.previous_files) == "table" and previous_receipt.previous_files or {}) do remember(previous) end
             remember(previous_receipt)
             if #files > 0 then result.previous_files = files end
+        elseif #legacy_files > 0 then
+            result.previous_files = legacy_files
         end
         return result
     end
@@ -974,6 +987,13 @@ local function download_attachment(key, download_callback, progress_callback)
     local attributes = lfs.attributes(temporary)
     if not attributes or attributes.size == 0 then os.remove(temporary); return nil, "The downloaded attachment is empty" end
     report_progress(progress_callback, "saving_attachment")
+    -- Publish an untrusted identity before changing any document bytes. If
+    -- either subsequent rename fails or execution stops, offline readers and
+    -- cache checks reject this receipt until a download completes successfully.
+    local pending_receipt = receipt()
+    pending_receipt.download_pending = true
+    ok, err = write_json(metadata_path, pending_receipt)
+    if not ok then os.remove(temporary); return nil, "Could not save attachment metadata: " .. tostring(err) end
     ok, err = os.rename(temporary, target_path)
     if not ok then os.remove(temporary); return nil, "Could not save attachment: " .. tostring(err) end
     local mtime = tonumber(attachment.data.mtime)
@@ -1054,8 +1074,8 @@ local function parent_item(items, item)
 end
 
 local function item_label(item)
-    local author = item.meta and item.meta.creatorSummary or "Unknown"
-    return author .. " - " .. (item.data.title or "Untitled")
+    local author = item.meta and item.meta.creatorSummary or I18n.text("Unknown")
+    return author .. " - " .. (item.data.title or I18n.text("Untitled"))
 end
 
 local function visible_attachment(items, item)
@@ -1122,7 +1142,7 @@ function API.displayCollection(key)
             local source = parent or item
             if contains(source.data.collections, key) then
                 attachments[#attachments + 1] = attachment_entry(item_key, item, parent,
-                    parent and item_label(parent) or (item.data.title or item.data.filename or "Untitled"))
+                    parent and item_label(parent) or (item.data.title or item.data.filename or I18n.text("Untitled")))
             end
         end
     end
@@ -1138,11 +1158,11 @@ function API.displaySearchResults(query)
     for key, item in pairs(items) do
         if visible_attachment(items, item) then
             local parent = parent_item(items, item)
-            local label = parent and item_label(parent) or (item.data.title or item.data.filename or "Untitled")
+            local label = parent and item_label(parent) or (item.data.title or item.data.filename or I18n.text("Untitled"))
             if parent and type(parent.data.DOI) == "string" and parent.data.DOI ~= "" then label = label .. " - " .. parent.data.DOI end
-            local start, matched = 1, true
+            local search_label, start, matched = #words > 0 and label:lower() or label, 1, true
             for _, word in ipairs(words) do
-                local first, last = label:lower():find(word, start, true)
+                local first, last = search_label:find(word, start, true)
                 if not first then matched = false; break end
                 start = last + 1
             end

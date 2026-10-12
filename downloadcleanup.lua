@@ -2,7 +2,7 @@
 local JSON = require("json")
 local lfs = require("libs/libkoreader-lfs")
 local ffiutil = require("ffi/util")
-local sha2 = require("ffi/sha2")
+local FileUtil = require("fileutil")
 local LocalFiles = require("localfiles")
 local LibraryCache = require("librarycache")
 local logger = require("logger")
@@ -15,10 +15,7 @@ local cache_names = { [".zotero-cache.json"] = true, [".zotero-cache.json.tmp"] 
     [".zotero-download.part"] = true, [".zotero-download.part.unpacked"] = true,
     [".zotero-download.part.unpacked.part"] = true, [JOURNAL] = true, [JOURNAL .. ".tmp"] = true }
 
-local function filename(name)
-    return type(name) == "string" and name ~= "" and name ~= "." and name ~= ".."
-        and not name:find("[/\\%z]") and not name:match("^%.zotero%-")
-end
+local filename = FileUtil.validFilename
 local function array(value)
     if type(value) ~= "table" then return false end
     local count = 0
@@ -45,27 +42,13 @@ local function unredirected(path, mode)
 end
 local function read_json(path)
     if not unredirected(path, "file") or (lfs.attributes(path, "size") or 0) > 1024 * 1024 then return nil end
-    local file = io.open(path, "rb")
-    if not file then return nil end
-    local content = file:read("*a"); file:close()
-    local ok, value = pcall(JSON.decode, content)
-    if ok and type(value) == "table" then return value end
+    return FileUtil.readJSON(path)
 end
 local function write_json(path, value)
     if lfs.symlinkattributes(path, "mode") == "link" or lfs.symlinkattributes(path .. ".tmp", "mode") == "link" then
         return nil, "The local file path changed. Scan the downloads again."
     end
-    local ok, content = pcall(JSON.encode, value)
-    if not ok then return nil, tostring(content) end
-    local temporary = path .. ".tmp"
-    local file, err = io.open(temporary, "wb")
-    if not file then return nil, err end
-    local written, write_err = file:write(content)
-    local closed, close_err = file:close()
-    if not written or not closed then os.remove(temporary); return nil, write_err or close_err end
-    ok, err = os.rename(temporary, path)
-    if not ok then os.remove(temporary) end
-    return ok, err
+    return FileUtil.writeJSON(path, value)
 end
 local function entries(path)
     local result = {}
@@ -96,18 +79,7 @@ local function valid_receipt(value)
         or type(value.md5) == "string" and #value.md5 == 32 and value.md5:match("^%x+$"))
 end
 local function digest(path, progress)
-    local file = io.open(path, "rb")
-    if not file then return nil end
-    local update = sha2.md5()
-    while true do
-        local chunk, err = file:read(65536)
-        if not chunk then
-            file:close()
-            return not err and update() or nil
-        end
-        update(chunk)
-        if progress then progress({ stage = "scanning_downloads" }) end
-    end
+    return FileUtil.md5(path, progress and function() progress({ stage = "scanning_downloads" }) end)
 end
 
 local function snapshot(path, progress)
@@ -242,9 +214,15 @@ function Cleanup.scanDownloads(api, progress)
                 else unknown(directory .. "/" .. JOURNAL) end
             end
         elseif lfs.attributes(directory .. "/" .. JOURNAL) then unknown(directory .. "/" .. JOURNAL) end
-        local slot_files = {}
+        local slot_files, related = {}, {}
         for name in pairs(owned) do slot_files[#slot_files + 1] = name end
         table.sort(slot_files)
+        for _, documents in ipairs({ owned, pending_names }) do
+            for name in pairs(documents) do
+                related[(name:match("^(.*)%.") or name) .. ".sdr"] = true
+                related[name .. ".kpdfview.lua"] = true
+            end
+        end
         for _, name in ipairs(names) do
             local path = directory .. "/" .. name
             if owned[name] and types[name] then
@@ -261,15 +239,8 @@ function Cleanup.scanDownloads(api, progress)
                     logger.warn("Zotero cleanup could not verify download", key)
                     unknown(path)
                 end
-            elseif not cache_names[name] then
-                local related = false
-                for document in pairs(owned) do
-                    if name == (document:match("^(.*)%.") or document) .. ".sdr" or name == document .. ".kpdfview.lua" then related = true end
-                end
-                for document in pairs(pending_names) do
-                    if name == (document:match("^(.*)%.") or document) .. ".sdr" or name == document .. ".kpdfview.lua" then related = true end
-                end
-                if not related then unknown(path) end
+            elseif not cache_names[name] and not related[name] then
+                unknown(path)
             end
             if progress then progress({ stage = "scanning_downloads" }) end
         end
@@ -311,15 +282,12 @@ local function validate_record(record)
 end
 
 local function normalize_task(task)
-    for i, path in ipairs(task.files) do
-        local normalized = absolute(path)
-        if not normalized then return nil end
-        task.files[i] = normalized
-    end
-    for i, path in ipairs(task.dirs) do
-        local normalized = absolute(path)
-        if not normalized then return nil end
-        task.dirs[i] = normalized
+    for _, paths in ipairs({ task.files, task.dirs }) do
+        for i, path in ipairs(paths) do
+            local normalized = absolute(path)
+            if not normalized then return nil end
+            paths[i] = normalized
+        end
     end
     if task.cache_file then
         local normalized = absolute(task.cache_file)
@@ -410,18 +378,8 @@ function Cleanup.removeTarget(record, progress)
         task.slot_files = record.slot_files
     end
     if not task or not validate_task(record, task) then return "failed", "The local cleanup paths are invalid." end
-    local reader = require("apps/reader/readerui").instance
-    if reader and reader.doc_settings then
-        local active = LocalFiles.settingsTask(reader.doc_settings)
-        local protected = {}
-        for _, path in ipairs(active.files) do protected[absolute(path)] = true end
-        if active.cache_file then protected[absolute(active.cache_file)] = true end
-        for _, path in ipairs(task.files) do
-            if protected[path] then return "open", "Close the open document before deleting downloads that share its reading data." end
-        end
-        if task.cache_file and protected[task.cache_file] then
-            return "open", "Close the open document before deleting downloads that share its reading data."
-        end
+    if LocalFiles.sharesOpenSettings(task) then
+        return "open", "Close the open document before deleting downloads that share its reading data."
     end
     if not record.cleanup_only then
         saved.tasks[record.filename] = task

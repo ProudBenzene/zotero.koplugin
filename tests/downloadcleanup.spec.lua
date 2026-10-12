@@ -264,7 +264,7 @@ describe("All-account local download cleanup",function()
         assert(stats.failed==1 and support.read(path)=="download" and support.purged_path==nil)
     end)
 
-    it("retries cleanup after the PDF is gone including saved hash sidecar paths",function()
+    it("defers pending hash cleanup until an open reader with newly saved shared settings closes",function()
         local path,dir=download("123","ATTACH01","paper.pdf")
         local hash=string.rep("a",32)
         local sidecar=support.directory.."/hashdocsettings/aa/"..hash..".sdr"
@@ -279,6 +279,15 @@ describe("All-account local download cleanup",function()
         os.remove=original
         local retry=Cleanup.scanDownloads(API)
         assert(retry.pending==1 and retry.pdf==0)
+        local other=support.directory.."/ordinary.pdf"
+        support.doc_settings[other]={hash_sidecar_dir=sidecar}
+        local reader=require("apps/reader/readerui")
+        reader.instance={document={file=other},doc_settings=require("docsettings"):open(other)}
+        assert(reader.instance.doc_settings.candidates==nil)
+        stats=remove(retry)
+        assert(stats.open==1 and stats.cleaned==0 and stats.failed==0 and support.read(metadata)=="reading data")
+        assert(lfs.attributes(dir.."/.zotero-cleanup.json"))
+        reader.instance=nil
         stats=remove(retry)
         assert(stats.cleaned==1 and stats.failed==0 and not lfs.attributes(metadata) and not lfs.attributes(dir.."/.zotero-cleanup.json"))
     end)

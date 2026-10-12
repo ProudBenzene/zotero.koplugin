@@ -217,6 +217,39 @@ describe("Zotero API offline regressions", function()
         assert(support.read(API.cache_path)==disk)
     end)
 
+    it("rejects malformed deletion arrays without advancing the cursor and retries the complete sync", function()
+        support.seed({OLDITEM1=support.attachment("OLDITEM1","old.pdf")},
+            {GONE0001={key="GONE0001",data={name="Old collection"}}},10)
+        local disk=support.read(API.cache_path)
+        local invalid={
+            {OLDITEM1=true}, {["1"]="OLDITEM1"}, {[2]="OLDITEM1"},
+            {"OLDITEM1",extra="OTHER001"}, {123}, {false}, {{key="OLDITEM1"}}, {""}, {"invalid-key"},
+        }
+        for _,field in ipairs({"items","collections"}) do
+            for _,keys in ipairs(invalid) do
+                local deleted={items={"OLDITEM1"},collections={"GONE0001"}}
+                deleted[field]=keys
+                support.response=function(req)
+                    if req.url:find("/items?",1,true) then
+                        assert(req.url:find("since=10",1,true) and req.headers["If-Modified-Since-Version"]=="10")
+                    end
+                    return default_sync(req,{support.attachment("NEWITEM1","new.pdf")},{},deleted,11)
+                end
+                local err=API.syncAllItems()
+                assert(err and err:find("invalid deletion log",1,true))
+                assert(API.getLibraryVersion()==10 and support.read(API.cache_path)==disk)
+                assert(API.getItems().OLDITEM1 and not API.getItems().NEWITEM1 and API.getCollections().GONE0001)
+            end
+        end
+        support.response=function(req)
+            assert(not req.url:find("since=11",1,true))
+            return default_sync(req,{support.attachment("NEWITEM1","new.pdf")},{},
+                {items={"OLDITEM1"},collections={"GONE0001"}},11)
+        end
+        assert(API.syncAllItems()==nil and API.getLibraryVersion()==11)
+        assert(not API.getItems().OLDITEM1 and API.getItems().NEWITEM1 and not API.getCollections().GONE0001)
+    end)
+
     it("preserves the last snapshot if atomic publication fails", function()
         support.seed({OLDITEM1=support.attachment("OLDITEM1","old.pdf")},{},10)
         local disk=support.read(API.cache_path)
@@ -386,6 +419,173 @@ describe("Zotero API offline regressions", function()
         local receipt=support.JSON.decode(support.read(directory.."/.zotero-cache.json"))
         assert(receipt.filename=="renamed.pdf" and #receipt.previous_files==1 and receipt.previous_files[1].filename=="paper.pdf")
         assert(support.read(path)=="old PDF")
+    end)
+
+    it("preserves renamed legacy downloads through publication failures, restart and retry",function()
+        local Cleanup=require("downloadcleanup")
+        local index=0
+        for _,extension in ipairs({"pdf","epub"}) do
+        for _,checksum in ipairs({false,true}) do
+        for _,failure in ipairs({"file","receipt"}) do
+            index=index+1
+            local key="LEGACY0"..index
+            local item=support.attachment(key,"new."..extension,false,11)
+            if extension=="epub" then item.data.contentType="application/epub+zip" end
+            if checksum then item.data.md5=HELLO_MD5 end
+            support.seed({[key]=item},{},11)
+            local directory,path=API.getDirAndPath(key)
+            assert(support.makePath(directory))
+            local old=directory.."/old."..extension
+            support.write(old,"legacy document")
+            local receipt_path=directory.."/.zotero-cache.json"
+            support.write(receipt_path,support.JSON.encode({version=10,md5=checksum and string.rep("a",32) or nil}))
+            local before=Cleanup.scanDownloads(API)
+            assert(#before.targets==1 and before.targets[1].path==old)
+            support.response=function(req) return support.respond(req,"hello") end
+            local rename=os.rename
+            local receipt_writes=0
+            os.rename=function(from,to)
+                if to==receipt_path then receipt_writes=receipt_writes+1 end
+                if failure=="file" and to==path or failure=="receipt" and to==receipt_path and receipt_writes==2 then
+                    return nil,"publication failure"
+                end
+                return rename(from,to)
+            end
+            local result,err=API.downloadAndGetPath(key)
+            os.rename=rename
+            assert(not result and err:find("publication failure",1,true) and support.read(old)=="legacy document")
+            local pending=support.JSON.decode(support.read(receipt_path))
+            assert(pending.download_pending and #pending.previous_files==1
+                and pending.previous_files[1].filename=="old."..extension
+                and pending.previous_files[1].content_type==item.data.contentType)
+            API.init(API.zotero_dir)
+            assert(API.getAttachmentStatus(key)~="downloaded")
+            local interrupted=Cleanup.scanDownloads(API)
+            assert(#interrupted.targets==(failure=="file" and 1 or 2) and #interrupted.unknown==0)
+            assert(API.downloadAndGetPath(key)==path)
+            local completed=support.JSON.decode(support.read(receipt_path))
+            assert(not completed.download_pending and #completed.previous_files==1
+                and completed.previous_files[1].filename=="old."..extension)
+            local scan=Cleanup.scanDownloads(API)
+            assert(#scan.targets==2 and #scan.unknown==0)
+            local stats=Cleanup.newStats(scan)
+            for _,target in ipairs(scan.targets) do Cleanup.processTarget(target,stats) end
+            assert(stats.deleted==2 and stats.failed==0 and stats.pending==0
+                and not require("libs/libkoreader-lfs").attributes(old))
+        end
+        end
+        end
+    end)
+
+    it("inherits only checksum-matched legacy filenames among multiple candidates",function()
+        local directory,path,item=cached_attachment("imported_file",HELLO_MD5)
+        local old=directory.."/old.epub"
+        support.write(old,"matching legacy EPUB")
+        local old_hash=string.rep("a",32)
+        support.digests["matching legacy EPUB"]=old_hash
+        support.write(directory.."/unrelated.pdf","unrelated document")
+        support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=10,md5=old_hash:upper()}))
+        support.response=function(req) return support.respond(req,"hello") end
+        assert(API.downloadAndGetPath(item.key)==path)
+        local receipt=support.JSON.decode(support.read(directory.."/.zotero-cache.json"))
+        assert(#receipt.previous_files==1 and receipt.previous_files[1].filename=="old.epub"
+            and receipt.previous_files[1].content_type=="application/epub+zip")
+        local Cleanup=require("downloadcleanup")
+        local scan=Cleanup.scanDownloads(API)
+        assert(#scan.targets==2 and #scan.unknown==1 and scan.unknown[1]==directory.."/unrelated.pdf")
+    end)
+
+    it("does not inherit ambiguous legacy filenames without a checksum",function()
+        local directory,path,item=cached_attachment()
+        item.data.filename="new.pdf"
+        support.write(directory.."/other.epub","unidentified document")
+        support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=10}))
+        support.response=function(req) return support.respond(req,"hello") end
+        assert(API.downloadAndGetPath(item.key)==directory.."/new.pdf")
+        local receipt=support.JSON.decode(support.read(directory.."/.zotero-cache.json"))
+        assert(receipt.previous_files==nil and support.read(path)=="old PDF")
+        local scan=require("downloadcleanup").scanDownloads(API)
+        assert(#scan.targets==1 and #scan.unknown==2)
+    end)
+
+    it("counts the current file when deciding whether legacy ownership is unique",function()
+        local directory,path,item=cached_attachment()
+        support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=item.version}))
+        support.write(directory.."/unrelated.epub","unidentified document")
+        assert(API.downloadAndGetPath(item.key)==path and #support.requests==0)
+        local receipt=support.JSON.decode(support.read(directory.."/.zotero-cache.json"))
+        assert(receipt.format==1 and receipt.previous_files==nil)
+        local scan=require("downloadcleanup").scanDownloads(API)
+        assert(#scan.targets==1 and #scan.unknown==1 and scan.unknown[1]==directory.."/unrelated.epub")
+    end)
+
+    it("does not migrate foreign, unsupported or invalid receipts as legacy ownership",function()
+        local directory,path,item=cached_attachment()
+        item.data.filename="new.pdf"
+        for _,previous in ipairs({{version=10,source="other"},{version=10,format=2},{version="10"},
+            {version=10,format=1,source="zotero.koplugin",user_id="456",attachment_key=item.key,
+                filename="paper.pdf",content_type="application/pdf"}}) do
+            os.remove(directory.."/new.pdf")
+            support.write(directory.."/.zotero-cache.json",support.JSON.encode(previous))
+            support.response=function(req) return support.respond(req,"hello") end
+            assert(API.downloadAndGetPath(item.key)==directory.."/new.pdf")
+            local receipt=support.JSON.decode(support.read(directory.."/.zotero-cache.json"))
+            assert(receipt.previous_files==nil and support.read(path)=="old PDF")
+        end
+    end)
+
+    it("ignores redirected files and reserved names when migrating legacy ownership",function()
+        local directory,path,item=cached_attachment()
+        item.data.filename="new.pdf"
+        support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=10}))
+        local outside=support.directory.."/outside.pdf"
+        support.write(outside,"ordinary document")
+        assert(support.execute("ln -s "..support.quote(outside).." "..support.quote(directory.."/redirect.pdf")))
+        assert(support.makePath(directory.."/folder.epub"))
+        support.write(directory.."/.zotero-extra.pdf","reserved name")
+        support.response=function(req) return support.respond(req,"hello") end
+        assert(API.downloadAndGetPath(item.key)==directory.."/new.pdf")
+        local receipt=support.JSON.decode(support.read(directory.."/.zotero-cache.json"))
+        assert(#receipt.previous_files==1 and receipt.previous_files[1].filename=="paper.pdf")
+        assert(support.read(path)=="old PDF" and support.read(outside)=="ordinary document")
+    end)
+
+    it("keeps the old receipt intact when legacy directory enumeration fails",function()
+        local directory,path,item=cached_attachment()
+        item.data.filename="new.pdf"
+        local receipt_path=directory.."/.zotero-cache.json"
+        local receipt=support.JSON.encode({version=10})
+        support.write(receipt_path,receipt)
+        local lfs=require("libs/libkoreader-lfs")
+        local dir=lfs.dir
+        lfs.dir=function(folder) if folder==directory then error("cannot list previous downloads") end;return dir(folder) end
+        support.response=function(req) return support.respond(req,"hello") end
+        local result,err=API.downloadAndGetPath(item.key)
+        lfs.dir=dir
+        assert(not result and err:find("cannot list previous downloads",1,true)
+            and support.read(receipt_path)==receipt and support.read(path)=="old PDF" and #support.requests==0)
+    end)
+
+    it("keeps legacy ownership evidence when checksum inspection fails",function()
+        local directory,path,item=cached_attachment()
+        item.data.filename="new.pdf"
+        support.write(directory.."/other.epub","another candidate")
+        local receipt_path=directory.."/.zotero-cache.json"
+        local receipt=support.JSON.encode({version=10,md5=string.rep("a",32)})
+        support.write(receipt_path,receipt)
+        local open=io.open
+        local closed=false
+        io.open=function(file,mode)
+            if file==path and mode=="rb" then
+                return {read=function() return nil,"previous file read failed" end,
+                    close=function() closed=true;return true end}
+            end
+            return open(file,mode)
+        end
+        local result,err=API.downloadAndGetPath(item.key)
+        io.open=open
+        assert(not result and err:find("previous file read failed",1,true) and closed
+            and support.read(receipt_path)==receipt and support.read(path)=="old PDF" and #support.requests==0)
     end)
 
     it("does not use a sibling's cached version to skip a changed file", function()

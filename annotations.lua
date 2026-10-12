@@ -4,8 +4,9 @@ local JSON = require("json")
 local lfs = require("libs/libkoreader-lfs")
 local Blitbuffer = require("ffi/blitbuffer")
 local BaseUtil = require("ffi/util")
-local _ = require("gettext")
+local I18n = require("i18n")
 local AnnotationPolicy = require("annotationpolicy")
+local FileUtil = require("fileutil")
 local Annotations = {}
 local CACHE_NAME = ".zotero-annotations.json"
 local SOURCE = "zotero.koplugin"
@@ -14,40 +15,7 @@ local SUPPORTED = { highlight = "lighten", underline = "underscore", image = "zo
 local FIELDS = { "annotationType", "annotationPosition", "annotationText", "annotationComment",
     "annotationColor", "annotationPageLabel", "annotationSortIndex", "dateAdded", "dateModified" }
 
-local chinese = {
-    ["Fetching PDF annotations…"] = "正在获取 PDF 批注…",
-    ["Checking annotation file…"] = "正在核对批注对应的文件…",
-    ["Saving PDF annotations…"] = "正在保存 PDF 批注…",
-    ["Annotations changed. Retrying…"] = "批注已变化，正在重试…",
-    ["Synchronizing downloaded PDF annotations"] = "同步已下载 PDF 的批注",
-    ["Refetch downloaded PDF annotations"] = "重新获取已下载 PDF 的批注",
-    ["Refresh annotations"] = "更新批注",
-    ["Refreshing PDF annotations"] = "正在更新 PDF 批注",
-    ["PDF annotations updated."] = "PDF 批注已更新。",
-    ["Area annotation"] = "区域批注",
-    ["No comment."] = "无附属评论。",
-    ["Go to annotation"] = "转到批注",
-    ["Yellow"] = "黄", ["Red"] = "红", ["Green"] = "绿", ["Blue"] = "蓝", ["Purple"] = "紫",
-    ["Magenta"] = "品红", ["Orange"] = "橙", ["Gray"] = "灰", ["Olive"] = "橄榄", ["Cyan"] = "青",
-    ["Zotero annotations are read-only"] = "Zotero 批注只读",
-    ["Edit this annotation in Zotero, then synchronize and reopen the PDF."] = "请在 Zotero 中修改此批注，然后同步并重新打开 PDF。",
-    ["PDF file protected by Zotero"] = "Zotero PDF 原文件已保护",
-    ["This Zotero PDF is protected. Local annotations are saved in KOReader settings."] = "此 Zotero PDF 原文件已保护。本地批注保存于 KOReader 文档设置。",
-    ["Apply current style and color to local highlights? Zotero annotations stay read-only."] = "将当前样式和颜色应用于本地高亮？Zotero 批注保持只读。",
-    ["Update selected local annotations? Zotero annotations stay read-only."] = "修改选中的本地批注？Zotero 批注保持只读。",
-    ["Local annotations updated: %d; read-only Zotero annotations skipped: %d"] = "已修改本地批注：%d；已跳过只读 Zotero 批注：%d",
-    ["PDF annotations were not updated."] = "PDF 批注未更新。",
-    ["Could not apply Zotero annotations."] = "未能显示 Zotero 批注。",
-    ["Zotero annotations are displayed in original-page mode."] = "Zotero 批注支持原版页面显示，请关闭文字重排。",
-    ["PDF annotations cached: %d; unchanged: %d; failed: %d"] = "PDF 批注已缓存：%d；未变化：%d；失败：%d",
-    ["Unsupported annotations skipped: %d"] = "已跳过不支持的批注：%d",
-    ["Cached annotations take effect when the PDF is next opened."] = "缓存批注将在下次打开 PDF 时生效。",
-}
-function Annotations.text(message)
-    local language = type(_) == "table" and _.current_lang or ""
-    if language:match("^zh_CN") or language:match("^zh_Hans") then return chinese[message] or _(message) end
-    return _(message)
-end
+Annotations.text = I18n.text
 
 local function integer(value)
     return type(value) == "number" and value >= 0 and value < math.huge and value % 1 == 0
@@ -75,29 +43,13 @@ local function same_identity(a, b)
     return a.version == b.version
 end
 local function read_json(path)
-    local file, err = io.open(path, "rb")
-    if not file then return nil, err end
-    local content = file:read("*a")
-    file:close()
-    local ok, value = pcall(JSON.decode, content)
-    if not ok or type(value) ~= "table" then return nil, "Invalid annotation cache JSON" end
-    return value
+    return FileUtil.readJSON(path, "Invalid annotation cache JSON")
 end
 local function current_user(api)
     return tostring(api.getUserID()):match("^%s*(.-)%s*$")
 end
 local function write_json(path, value)
-    local ok, content = pcall(JSON.encode, value)
-    if not ok then return nil, "Could not encode PDF annotations" end
-    local temporary = path .. ".tmp"
-    local file, err = io.open(temporary, "wb")
-    if not file then return nil, err end
-    local written, write_err = file:write(content)
-    local closed, close_err = file:close()
-    if not written or not closed then os.remove(temporary); return nil, write_err or close_err end
-    ok, err = os.rename(temporary, path)
-    if not ok then os.remove(temporary) end
-    return ok, err
+    return FileUtil.writeJSON(path, value, "Could not encode PDF annotations")
 end
 local function emit(callback, stage, details)
     if callback then
@@ -180,7 +132,7 @@ local function local_identity(api, key)
     local attr = lfs.attributes(path)
     if not attr or attr.mode ~= "file" or attr.size == 0 then return nil end
     local receipt = read_json(directory .. "/.zotero-cache.json")
-    if not receipt then return nil end
+    if not receipt or receipt.download_pending then return nil end
     local identity = receipt.md5 and { md5 = receipt.md5 } or { version = receipt.version }
     if identity_valid(identity) then return identity end
 end
@@ -265,8 +217,11 @@ function Annotations.summary(stats)
         :format(stats.updated, stats.unchanged, stats.failed) }
     if stats.unsupported > 0 then lines[#lines + 1] = Annotations.text("Unsupported annotations skipped: %d"):format(stats.unsupported) end
     lines[#lines + 1] = Annotations.text("Cached annotations take effect when the PDF is next opened.")
-    for index = 1, math.min(5, #stats.errors) do lines[#lines + 1] = stats.errors[index] end
-    if #stats.errors > 5 then lines[#lines + 1] = ("… (%d)"):format(#stats.errors) end
+    for index = 1, math.min(5, #stats.errors) do
+        local key, detail = stats.errors[index]:match("^([^:]+): (.*)$")
+        lines[#lines + 1] = key and (key .. ": " .. I18n.error(detail)) or I18n.error(stats.errors[index])
+    end
+    if #stats.errors > 5 then lines[#lines + 1] = Annotations.text("… (%d)"):format(#stats.errors) end
     return table.concat(lines, "\n")
 end
 
@@ -402,13 +357,145 @@ local function owned(item, user_id, key)
         and source.user_id == user_id and source.attachment_key == key
 end
 
+local function projection_scope(item)
+    local source = type(item) == "table" and item.drawer and item.zotero_source
+    if type(source) == "table" and source.plugin == SOURCE
+        and type(source.user_id) == "string" and source.user_id:match("^%d+$")
+        and type(source.attachment_key) == "string" and source.attachment_key:match("^[A-Z0-9]+$") then
+        return source.user_id .. "/" .. source.attachment_key
+    end
+end
+
+local function copy_table(value)
+    local result = {}
+    for key, item in pairs(value or {}) do result[key] = item end
+    return result
+end
+
+-- Hash sidecars are shared by identical files. Keep their native annotations
+-- local, and store cloud projections/applied receipts together per account/key.
+-- The instance-local view preserves ReaderAnnotation's read/save contract.
+function Annotations.bindSettings(ui, config, user_id, key)
+    local scope = user_id .. "/" .. key
+    local previous = ui.document._zotero_settings
+    if previous and previous.config == config and previous.scope == scope then return previous end
+    if previous then Annotations.releaseReader(ui) end
+    local existing = config._zotero_settings
+    local binding = { config = config, scope = scope,
+        read = existing and existing.read or config.readSetting,
+        save = existing and existing.save or config.saveSetting }
+    local records = binding.read(config, "zotero_annotations")
+    records = type(records) == "table" and records or {}
+    binding.records = copy_table(records)
+    local legacy = binding.read(config, "annotations")
+    local groups = {}
+    for _, item in ipairs(type(legacy) == "table" and legacy or {}) do
+        local owner = projection_scope(item)
+        if owner then
+            groups[owner] = groups[owner] or {}
+            groups[owner][#groups[owner] + 1] = item
+        end
+    end
+    for owner, items in pairs(groups) do
+        if binding.records[owner] == nil then binding.records[owner] = { annotations = items } end
+    end
+    local applied = binding.read(config, "zotero_annotations_applied")
+    if type(applied) == "table" and type(applied.user_id) == "string" and type(applied.attachment_key) == "string" then
+        local owner = applied.user_id .. "/" .. applied.attachment_key
+        local record = binding.records[owner]
+        if records[owner] == nil then
+            record = copy_table(record)
+            record.annotations, record.applied = record.annotations or {}, applied
+            binding.records[owner] = record
+        end
+    end
+    local function local_items(items)
+        local result = {}
+        for _, item in ipairs(items or {}) do
+            if not projection_scope(item) then result[#result + 1] = item end
+        end
+        return result
+    end
+    binding.read_view = function(self, name, default)
+        local record = binding.records[scope]
+        if name == "zotero_annotations_applied" then
+            return type(record) == "table" and record.applied or default
+        elseif name == "annotations" then
+            local native = binding.read(self, name)
+            local cloud = type(record) == "table" and record.annotations
+            if native == nil and cloud == nil then return default end
+            local result = local_items(native)
+            for _, item in ipairs(type(cloud) == "table" and cloud or {}) do
+                if projection_scope(item) == scope then result[#result + 1] = item end
+            end
+            return result
+        end
+        return binding.read(self, name, default)
+    end
+    binding.save_view = function(self, name, value)
+        if name ~= "annotations" and name ~= "zotero_annotations_applied" then return binding.save(self, name, value) end
+        local next_records = copy_table(binding.records)
+        local record = next_records[scope]
+        record = copy_table(type(record) == "table" and record or {})
+        if name == "annotations" then
+            record.annotations = {}
+            for _, item in ipairs(value or {}) do
+                if projection_scope(item) == scope then record.annotations[#record.annotations + 1] = item end
+            end
+        else record.applied = value end
+        next_records[scope] = record
+        local data = self.data
+        local old_native, old_records, old_applied = data.annotations, data.zotero_annotations, data.zotero_annotations_applied
+        local ok, err = pcall(function()
+            binding.save(self, "zotero_annotations", next_records)
+            if name == "annotations" then binding.save(self, name, local_items(value)) end
+            binding.save(self, "zotero_annotations_applied", nil)
+        end)
+        if not ok then
+            data.annotations, data.zotero_annotations, data.zotero_annotations_applied = old_native, old_records, old_applied
+            error(err)
+        end
+        binding.records = next_records
+    end
+    config.readSetting, config.saveSetting = binding.read_view, binding.save_view
+    -- A native hash -> doc/dir flush purges its old candidates. That hash
+    -- metadata may still hold another attachment's projection and local data.
+    binding.purge = existing and existing.purge or config.purge
+    if binding.purge then
+        binding.purge_view = function(self, keep, ...)
+            if not keep or not self.hash_sidecar_dir then return binding.purge(self, keep, ...) end
+            local candidates, filtered = self.candidates, {}
+            local prefix = self.hash_sidecar_dir .. "/"
+            for _, candidate in ipairs(candidates or {}) do
+                if candidate.path:sub(1, #prefix) ~= prefix then filtered[#filtered + 1] = candidate end
+            end
+            self.candidates = filtered
+            local ok, err = pcall(binding.purge, self, keep, ...)
+            self.candidates = candidates
+            if not ok then error(err) end
+        end
+        config.purge = binding.purge_view
+    end
+    config._zotero_settings = binding
+    ui.document._zotero_settings = binding
+    return binding
+end
+
 function Annotations.protectReader(api, ui, key)
-    local user_id = current_user(api)
-    AnnotationPolicy.install(ui, function(item) return owned(item, user_id, key) end, Annotations.text)
+    AnnotationPolicy.install(ui, projection_scope, Annotations.text)
 end
 
 function Annotations.releaseReader(ui)
     AnnotationPolicy.remove(ui)
+    local binding = ui.document and ui.document._zotero_settings
+    if binding then
+        local config = binding.config
+        if config.readSetting == binding.read_view then config.readSetting = binding.read end
+        if config.saveSetting == binding.save_view then config.saveSetting = binding.save end
+        if config.purge == binding.purge_view then config.purge = binding.purge end
+        if config._zotero_settings == binding then config._zotero_settings = nil end
+        ui.document._zotero_settings = nil
+    end
 end
 
 -- Resolve only this account's managed storage paths. Opening an arbitrary PDF
@@ -432,7 +519,7 @@ end
 -- Instance-local adapter: cloud boxes are authoritative, even without an OCR
 -- text layer. Ordinary KOReader annotations still use the original methods.
 function Annotations.installAdapter(ui, user_id, key)
-    AnnotationPolicy.install(ui, function(item) return owned(item, user_id, key) end, Annotations.text)
+    AnnotationPolicy.install(ui, projection_scope, Annotations.text)
     local document = ui.document
     local state = document._zotero_adapter
     if not state then
@@ -555,7 +642,7 @@ function Annotations.reindex(ui)
     if not state then return end
     state.positions, state.boxes = {}, {}
     for _, item in ipairs(ui.annotation.annotations) do
-        if owned(item, state.user_id, state.key) and item.drawer and item.pos0 and item.pos1 then
+        if owned(item, state.user_id, state.key) and item.pos0 and item.pos1 then
             state.positions[item.pos0], state.positions[item.pos1] = true, true
             state.boxes[item.pos0] = { [item.page] = item.pboxes }
             if item.ext then
@@ -569,25 +656,42 @@ function Annotations.reindex(ui)
 end
 
 -- Called after ReaderAnnotation:onReadSettings (including legacy migration).
--- The normal ReaderUI SaveSettings/flush persists the merged list and receipt
+-- Normal SaveSettings/flush persists each scoped projection and its receipt
 -- together; failed flushes cannot leave a separate 'applied' cursor on disk.
 function Annotations.applyToReader(api, ui, config, key)
     if not ui.annotation or type(ui.annotation.annotations) ~= "table" then
         return nil, "Reader annotations are not initialized"
     end
     -- Protect even a PDF with no cache, an invalid cache or no cloud items.
-    Annotations.protectReader(api, ui, key)
     local identity, user_id = local_identity(api, key), current_user(api)
+    local binding = Annotations.bindSettings(ui, config, user_id, key)
+    Annotations.protectReader(api, ui, key)
     local has_imports = false
+    local visible, foreign = {}, false
     for _, item in ipairs(ui.annotation.annotations) do
-        if owned(item, user_id, key) then has_imports = true; break end
+        local owner = projection_scope(item)
+        if owner and owner ~= binding.scope then foreign = true
+        else
+            visible[#visible + 1] = item
+            if owned(item, user_id, key) then has_imports = true end
+        end
     end
+    if not has_imports then
+        for _, item in ipairs(config:readSetting("annotations") or {}) do
+            if owned(item, user_id, key) then visible[#visible + 1] = item; has_imports = true end
+        end
+        if has_imports then ui.annotation.annotations = visible end
+    end
+    if foreign then ui.annotation.annotations = visible end
     -- Keep the previous successful projection usable if fetching/decoding the
     -- independent cache failed. Never draw it over a replacement PDF, though.
     if has_imports then
         local ok, adapter_err = pcall(Annotations.installAdapter, ui, user_id, key)
         if not ok then return nil, tostring(adapter_err) end
         Annotations.reindex(ui)
+        -- The scoped settings view joins local and cloud lists. Restore native
+        -- order before a cache, conversion or save failure can keep that view.
+        if ui.annotation.sortItems then ui.annotation:sortItems(ui.annotation.annotations) end
         local applied = config:readSetting("zotero_annotations_applied")
         ui.document._zotero_adapter.file_matches = type(applied) == "table"
             and applied.user_id == user_id and applied.attachment_key == key and same_identity(applied.file_identity, identity) or false
@@ -614,18 +718,20 @@ function Annotations.applyToReader(api, ui, config, key)
     local ok
     ok, err = pcall(Annotations.installAdapter, ui, cache.user_id, key)
     if not ok then return nil, tostring(err) end
-    local previous_annotations = config:readSetting("annotations")
-    local previous_applied = config:readSetting("zotero_annotations_applied")
+    local previous_annotations, previous_records = config.data.annotations, config.data.zotero_annotations
+    local previous_applied, previous_binding = config.data.zotero_annotations_applied, binding.records
     ok, err = pcall(function()
         config:saveSetting("annotations", combined)
         config:saveSetting("zotero_annotations_applied", { user_id = cache.user_id, attachment_key = key,
             library_version = cache.library_version, file_identity = cache.file_identity, converter_version = CONVERTER_VERSION })
     end)
     if not ok then
-        -- LuaSettings changes are in memory here. Roll back both fields even if
-        -- the failing saveSetting cannot be called again; native flush is later.
+        -- Roll back native data and its scoped view even if the failing setter
+        -- cannot be called again. Native flush happens later.
         config.data.annotations = previous_annotations
+        config.data.zotero_annotations = previous_records
         config.data.zotero_annotations_applied = previous_applied
+        binding.records = previous_binding
         return nil, "Could not save imported annotations: " .. tostring(err)
     end
     ui.annotation.annotations = combined

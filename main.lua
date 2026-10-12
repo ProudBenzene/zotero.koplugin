@@ -29,12 +29,6 @@ local logger = require("logger")
 
 local DEFAULT_LINES_PER_PAGE = 14
 
-local table_empty = function(table)
-    -- see https://stackoverflow.com/a/1252776
-    local next = next
-    return (next(table) == nil)
-end
-
 local ZoteroBrowser = Menu:extend{
     no_title = false,
     is_borderless = true,
@@ -76,7 +70,7 @@ function ZoteroBrowser:onLeftButtonTap()
     search_query_dialog = InputDialog:new{
         title = _("Search Zotero titles"),
         input = "",
-        input_hint = "search query",
+        input_hint = _("search query"),
         description = _("This will search title, first author and DOI of all entries."),
         buttons = {
             {
@@ -142,7 +136,7 @@ function ZoteroBrowser:onMenuSelect(item)
             UIManager:close(self.download_dialog)
             if e ~= nil then
                 local b = InfoMessage:new{
-                    text = _("Could not open file.") .. "\n" .. e,
+                    text = _("Could not open file.") .. "\n" .. I18n.error(e),
                     honor_silent_mode = false,
                     flush_events_on_show = true,
                     icon = "notice-warning"
@@ -154,7 +148,7 @@ function ZoteroBrowser:onMenuSelect(item)
                 ReaderUI:showReader(full_path)
                 if annotation_error then
                     UIManager:show(InfoMessage:new{
-                        text = Annotations.text("PDF annotations were not updated.") .. "\n" .. annotation_error,
+                        text = Annotations.text("PDF annotations were not updated.") .. "\n" .. I18n.error(annotation_error),
                         icon = "notice-warning", honor_silent_mode = false,
                     })
                 end
@@ -261,7 +255,7 @@ function ZoteroBrowser:refreshAnnotations(item)
         UIManager:show(InfoMessage:new{
             text = ok and cache and (Annotations.text("PDF annotations updated.") .. "\n" ..
                 Annotations.text("Cached annotations take effect when the PDF is next opened."))
-                or (Annotations.text("PDF annotations were not updated.") .. "\n" .. tostring(err)),
+                or (Annotations.text("PDF annotations were not updated.") .. "\n" .. I18n.error(err)),
             icon = ok and cache and "check" or "notice-warning", honor_silent_mode = false,
         })
     end)
@@ -270,7 +264,7 @@ end
 function ZoteroBrowser:displayAttachments(parent_key)
     self.current_view = { kind = "attachments", key = parent_key }
     local items = AttachmentMenu.children(ZoteroAPI.displayAttachments(parent_key))
-    if table_empty(items) then items[1] = { text = _("No Items"), is_label = true } end
+    if not next(items) then items[1] = { text = _("No Items", "attachments"), is_label = true } end
     self:setItems(items, AttachmentMenu.text("Attachments"), true)
 end
 
@@ -278,16 +272,17 @@ function ZoteroBrowser:displaySearchResults(query)
     self.current_view = { kind = "search", query = query }
     local ok, items = pcall(ZoteroAPI.displaySearchResults, query)
     if not ok then
-        UIManager:show(InfoMessage:new{ text = tostring(items), icon = "notice-warning" })
+        UIManager:show(InfoMessage:new{ text = I18n.error(items), icon = "notice-warning" })
         items = {}
     end
-    if table_empty(items) then
+    if not next(items) then
         table.insert(items, 1, {
-            ["text"] = _("No Results"),
+            ["text"] = _("No Results", query == "" and "library" or "search"),
             ["is_label"] = true,
         })
     end
-    self:setItems(items, query == "" and _("All Items") or _("Search results"))
+    -- Keep this Zotero label in English, independently of the host catalog.
+    self:setItems(items, query == "" and "All Items" or _("Search results"))
 end
 
 function ZoteroBrowser:displayCollection(collection_id)
@@ -297,20 +292,20 @@ function ZoteroBrowser:displayCollection(collection_id)
             collection_id and ZoteroAPI.getCollections()[collection_id]
     end)
     if not ok then
-        UIManager:show(InfoMessage:new{ text = tostring(items), icon = "notice-warning" })
+        UIManager:show(InfoMessage:new{ text = I18n.error(items), icon = "notice-warning" })
         items = {}
     end
 
     if collection_id == nil then
         table.insert(items, 1, {
-            ["text"] = _("All Items"),
+            ["text"] = "All Items",
             ["wildcard_collection"] = true
         })
     end
 
-    if table_empty(items) then
+    if not next(items) then
         table.insert(items, 1, {
-            ["text"] = _("No Items"),
+            ["text"] = _("No Items", "collection"),
             ["is_label"] = true,
         })
     end
@@ -363,6 +358,7 @@ function Plugin:prepareAnnotationImport(config, document)
         return
     end
     self.annotation_key = key
+    Annotations.bindSettings(self.ui, config, tostring(ZoteroAPI.getUserID()):match("^%s*(.-)%s*$"), key)
     config:saveSetting("highlight_write_into_pdf", false)
     Annotations.protectReader(ZoteroAPI, self.ui, key)
 end
@@ -386,7 +382,7 @@ function Plugin:onReadSettings(config)
         logger.info("Zotero annotations applied", self.annotation_key, result.imported, "imported", result.unsupported, "unsupported")
     end
     local message
-    if err then message = Annotations.text("Could not apply Zotero annotations.") .. "\n" .. err
+    if err then message = Annotations.text("Could not apply Zotero annotations.") .. "\n" .. I18n.error(err)
     elseif result and result.imported > 0 and self.ui.document.configurable.text_wrap == 1 then
         message = Annotations.text("Zotero annotations are displayed in original-page mode.")
     end
@@ -410,7 +406,7 @@ function Plugin:checkInitialized()
     local initialized = self.initialized and self.browser ~= nil and self.zotero_dialog ~= nil
     if not initialized then
         UIManager:show(InfoMessage:new{
-            text = _("Could not initialize Zotero.") .. "\n" .. (self.init_error or ""),
+            text = _("Could not initialize Zotero.") .. "\n" .. I18n.error(self.init_error or ""),
             timeout = 3,
             icon = "notice-warning"
         })
@@ -522,7 +518,7 @@ function Plugin:addToMainMenu(menu_items)
                             if result == nil then
                                 msg = _("Success, WebDAV works!")
                             else
-                                msg = _("WebDAV could not connect: ") .. result
+                                msg = _("WebDAV could not connect: ") .. I18n.error(result)
                             end
                             UIManager:show(InfoMessage:new{
                                 text = msg,
@@ -544,110 +540,63 @@ function Plugin:addToMainMenu(menu_items)
     }
 end
 
+local function show_account_dialog(plugin, field, title, fields, save)
+    local function close()
+        plugin[field]:onClose()
+        UIManager:close(plugin[field])
+    end
+    plugin[field] = MultiInputDialog:new{
+        title = title,
+        fields = fields,
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = close },
+            { text = _("Update"), callback = function()
+                if ZoteroAPI.isBusy() or not save(plugin[field]:getFields()) then return end
+                ZoteroAPI.saveSettings()
+                close()
+            end },
+        }},
+    }
+    UIManager:show(plugin[field])
+    plugin[field]:onShowKeyboard()
+end
+
 function Plugin:setAccount()
     if not self:checkInitialized() or ZoteroAPI.isBusy() then return end
-    self.account_dialog = MultiInputDialog:new{
-        title = _("Edit User Info"),
-        fields = {
-            {
-                text = ZoteroAPI.getUserID(),
-                hint = _("User ID (integer)"),
-            },
-            {
-                text = ZoteroAPI.getAPIKey(),
-                hint = _("API Key"),
-            },
-        },
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = function()
-                        self.account_dialog:onClose()
-                        UIManager:close(self.account_dialog)
-                    end
-                },
-                {
-                    text = _("Update"),
-                    callback = function()
-                        if ZoteroAPI.isBusy() then return end
-                        local fields = self.account_dialog:getFields()
-                        local user_id = (fields[1] or ""):match("^%s*(.-)%s*$")
-                        if not user_id:match("^%d+$") then
-                            UIManager:show(InfoMessage:new{
-                                text = _("The User ID must be an integer number."),
-                                timeout = 3,
-                                icon = "notice-warning"
-                            })
-                            return
-                        end
-
-                        local ok, err = ZoteroAPI.setUserID(user_id)
-                        if not ok then
-                            UIManager:show(InfoMessage:new{ text = err, icon = "notice-warning" })
-                            return
-                        end
-                        ZoteroAPI.setAPIKey(fields[2])
-                        ZoteroAPI.saveSettings()
-                        self.account_dialog:onClose()
-                        UIManager:close(self.account_dialog)
-                    end
-                },
-            },
-        },
-    }
-    UIManager:show(self.account_dialog)
-    self.account_dialog:onShowKeyboard()
+    show_account_dialog(self, "account_dialog", _("Edit User Info"), {
+        { text = ZoteroAPI.getUserID(), hint = _("User ID (integer)") },
+        { text = ZoteroAPI.getAPIKey(), hint = _("API Key") },
+    }, function(fields)
+        local user_id = (fields[1] or ""):match("^%s*(.-)%s*$")
+        if not user_id:match("^%d+$") then
+            UIManager:show(InfoMessage:new{
+                text = _("The User ID must be an integer number."),
+                timeout = 3, icon = "notice-warning",
+            })
+            return
+        end
+        local ok, err = ZoteroAPI.setUserID(user_id)
+        if not ok then
+            UIManager:show(InfoMessage:new{ text = I18n.error(err), icon = "notice-warning" })
+            return
+        end
+        ZoteroAPI.setAPIKey(fields[2])
+        return true
+    end)
 end
 
 function Plugin:setWebdavAccount()
     if not self:checkInitialized() or ZoteroAPI.isBusy() then return end
-    self.webdav_account_dialog = MultiInputDialog:new{
-        title = _("Edit WebDAV credentials"),
-        fields = {
-            {
-                text = ZoteroAPI.getWebDAVUrl(),
-                hint = _("URL")
-            },
-            {
-                text = ZoteroAPI.getWebDAVUser(),
-                hint = _("Username"),
-            },
-            {
-                text = ZoteroAPI.getWebDAVPassword(),
-                hint = _("Password"),
-            },
-        },
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = function()
-                        self.webdav_account_dialog:onClose()
-                        UIManager:close(self.webdav_account_dialog)
-                    end
-                },
-                {
-                    text = _("Update"),
-                    callback = function()
-                        if ZoteroAPI.isBusy() then return end
-                        local fields = self.webdav_account_dialog:getFields()
-
-                        ZoteroAPI.setWebDAVUrl(fields[1])
-                        ZoteroAPI.setWebDAVUser(fields[2])
-                        ZoteroAPI.setWebDAVPassword(fields[3])
-                        ZoteroAPI.saveSettings()
-                        self.webdav_account_dialog:onClose()
-                        UIManager:close(self.webdav_account_dialog)
-                    end
-                },
-            },
-        },
-    }
-    UIManager:show(self.webdav_account_dialog)
-    self.webdav_account_dialog:onShowKeyboard()
+    show_account_dialog(self, "webdav_account_dialog", _("Edit WebDAV credentials"), {
+        { text = ZoteroAPI.getWebDAVUrl(), hint = _("URL") },
+        { text = ZoteroAPI.getWebDAVUser(), hint = _("Username") },
+        { text = ZoteroAPI.getWebDAVPassword(), hint = _("Password") },
+    }, function(fields)
+        ZoteroAPI.setWebDAVUrl(fields[1])
+        ZoteroAPI.setWebDAVUser(fields[2])
+        ZoteroAPI.setWebDAVPassword(fields[3])
+        return true
+    end)
 end
 
 function Plugin:setItemsPerPage()
@@ -688,7 +637,7 @@ function Plugin:onZoteroOpenAction()
         self.browsing = false
         if loading then UIManager:close(loading) end
         if not ok then
-            UIManager:show(InfoMessage:new{ text = _("Could not load Zotero library.") .. "\n" .. tostring(err),
+            UIManager:show(InfoMessage:new{ text = _("Could not load Zotero library.") .. "\n" .. I18n.error(err),
                 honor_silent_mode = false, flush_events_on_show = true, icon = "notice-warning" })
             return
         end
@@ -736,7 +685,7 @@ function Plugin:onZoteroSyncAction(force_annotations)
             })
         else
             UIManager:show(InfoMessage:new{
-                text = _("Synchronization failed.") .. "\n" .. e,
+                text = _("Synchronization failed.") .. "\n" .. I18n.error(e),
                 honor_silent_mode = false,
                 flush_events_on_show = true,
                 icon = "notice-warning"

@@ -309,7 +309,7 @@ local network_errors = {
     wantread = "正在等待接收数据（wantread）", ["request failed"] = "请求失败",
 }
 local error_prefixes = { "Error: ", "Could not download attachment: ", "Network request failed: ",
-    "Connection failed: ", "Checking Zotero account: ", "Fetching deletions: " }
+    "Connection failed: ", "Fetching deletions: " }
 for message in pairs(chinese) do
     if message:sub(-2) == ": " then error_prefixes[#error_prefixes + 1] = message end
 end

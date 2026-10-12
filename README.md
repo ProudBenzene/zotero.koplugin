@@ -1,5 +1,7 @@
 # Zotero for KOReader
 
+[简体中文使用指南](README.zh-CN.md) · [汉化方案与术语](docs/localization-plan.zh-CN.md)
+
 This addon for [KOReader](https://github.com/koreader/koreader) allows you to view your Zotero collections.
 
 > [!NOTE]
@@ -18,12 +20,13 @@ This addon for [KOReader](https://github.com/koreader/koreader) allows you to vi
 </p>
 
 - **单向 PDF 批注同步**：导入 Zotero 云端高亮、下划线、区域批注及颜色、文字、评论，支持云端修改与删除；点按区域可查看评论。
-- **手动更新与离线查看**：Synchronize / Resync 更新已下载 PDF 的批注；Browse 长按附件可单独更新。重开后应用，最近阅读和文件管理器也能离线显示缓存。
-- **释放本机空间**：Browse 长按 PDF → 删除本地文件，清理 PDF、批注、书签和阅读进度；云端保留，可重新下载。
+- **手动更新与离线查看**：“同步”或“重新同步整个文献库”更新已下载 PDF 的批注；“浏览文献库”长按附件可单独更新。重开后应用，最近阅读和文件管理器也能离线显示缓存。
+- **释放本地空间**：“浏览文献库”长按 PDF → “删除本地文件”，清理 PDF、批注、书签和阅读进度；云端保留，可重新下载。
 - **保留本地数据**：独立批注缓存，保留本地批注、书签和阅读进度；不上传批注，不改写 PDF。
 - **云端批注只读**：禁止在 KOReader 修改或删除 Zotero 导入项；独立本地批注仍可编辑。受管 PDF 的原文件写入、批量写入及内嵌批注导入被阻止。
 - **同步与下载修复**：库版本一致性、增量删除、Zotero Storage / WebDAV 文件校验、网络重试与截断续传；失败保留旧缓存。
 - **浏览与性能优化**：同文献多附件分组、下载状态与长按详情、精简大库缓存，以及适合电子墨水屏的同步和下载进度。
+- **简体中文界面**：菜单、账户设置、搜索、进度、结果和插件错误说明随 KOReader 界面语言显示中文；英文及其他语言继续使用 KOReader 的翻译回退。`All Items`、`Zotero Annotation` 和 `Zotero key` 保留英文。
 
 ## Features
 * Synchronize a personal library via Zotero Web API v3, including trash and permanent deletions
@@ -34,7 +37,7 @@ This addon for [KOReader](https://github.com/koreader/koreader) allows you to vi
 * Supports Zotero File Storage and WebDAV storage with Basic authentication
 * Show download bytes and synchronization stages/counts with e-ink-friendly progress updates
 * View Zotero PDF highlights, underlines and area annotations offline
-* Search entries by the title of the publication, name of the first author or DOI.
+* Search PDF/EPUB attachments by publication title, author summary or DOI.
 ## Installation Guide
 1. Copy the files in this repository to `<KOReader>/plugins/zotero.koplugin`
 2. Obtain a dedicated API key in your [Zotero Settings](https://www.zotero.org/settings/keys). Enable access to your personal library and, for Zotero File Storage downloads, its files. Note the userID and the private key.
@@ -137,6 +140,7 @@ pandoc lua tests/json-integration.lua
 pandoc lua tests/koreader-integration.lua /path/to/koreader/frontend
 pandoc lua tests/annotationpolicy-integration.lua /path/to/koreader/frontend
 pandoc lua tests/localfiles-integration.lua /path/to/koreader/frontend/docsettings.lua
+pandoc lua tests/annotationstorage-integration.lua /path/to/koreader/frontend
 ```
 
 The offline suite uses KOReader/HTTP/JSON/crypto test doubles, real temporary files and real `unzip` operations. It requires no account credentials or network access. JSON and digest test doubles exercise protocol decisions, not the correctness of those external libraries. Live Zotero and WebDAV checks are recorded in the API audit; the computer transport adapters do not validate Kindle's LuaSocket/TLS or screen/input behavior.

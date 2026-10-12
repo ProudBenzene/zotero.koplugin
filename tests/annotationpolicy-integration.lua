@@ -416,6 +416,37 @@ local ok, err = xpcall(function()
     for _, item in ipairs(ui.annotation.annotations) do if item.zotero_source then updated = item end end
     check(updated.text == "Changed remotely", "Cloud changes remain authoritative")
     check(native_writes == 0 and native_pages == 0 and support.read(path) == "unchanged PDF bytes" and #support.requests == 0, "Local and cloud changes never write PDF or make network requests")
+    local gettext_mt = getmetatable(support.GetText)
+    local native_gettext = gettext_mt.__call
+    local native_chinese = {
+        ["Apply current style and color to all highlights"] = "将当前样式和颜色应用于所有高亮",
+        ["Write all highlights into PDF file"] = "将所有高亮写入 PDF 文件",
+    }
+    gettext_mt.__call = function(_, text) return native_chinese[text] or text end
+    support.GetText.current_lang = "zh_CN"
+    ui.highlight:showHighlightNoteOrDialog(ui.annotation:getItemIndex(updated))
+    check(last().title == "Zotero Annotation · 蓝" and last().text:find("Changed remotely", 1, true),
+        "Chinese annotation details keep the proper name, translate colors and preserve source text")
+    ui.highlight:deleteHighlight(ui.annotation:getItemIndex(updated))
+    check(last().text == "请在 Zotero 中修改此批注，然后同步并重新打开 PDF。",
+        "Chinese interface still denies native cloud mutation")
+    local chinese_menus = {}
+    ui.highlight:addToMainMenu(chinese_menus)
+    local style_found, write_found = false, false
+    for _, entry in ipairs(chinese_menus.highlight_options.sub_item_table) do
+        if entry.text == native_chinese["Apply current style and color to all highlights"] then
+            entry.callback()
+            style_found = last().text == "将当前样式和颜色应用于本地高亮？Zotero 批注保持只读。"
+        end
+        for _, child in ipairs(entry.sub_item_table or {}) do
+            if child.text == native_chinese["Write all highlights into PDF file"] then
+                write_found = entry.text_func() == "Zotero PDF 原文件已保护" and child.enabled == false
+            end
+        end
+    end
+    check(style_found and write_found, "Translated native menu labels still receive local-only and PDF-write protection")
+    support.GetText.current_lang = "C"
+    gettext_mt.__call = native_gettext
     check(PdfDocument.saveHighlight == original_save and ReaderHighlight.deleteHighlight == original_delete
         and ReaderBookmark.getBookmarkItemIndex == original_bookmark_index, "Native classes are unchanged")
     local ordinary = PdfDocument:extend{file = directory .. "/ordinary.pdf", _document = ui.document._document}

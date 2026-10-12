@@ -237,7 +237,7 @@ local ok, err = xpcall(function()
     painted=draw(2,2,visible)
     check(#painted==2,"Returning to native mode restores cloud drawing")
     ui.annotation:onSaveSettings()
-    check(config.data.annotations==ui.annotation.annotations,"Native SaveSettings retains provenance and merged items")
+    check(#config.data.annotations==2 and #config.data.zotero_annotations["123/ATTACH01"].annotations==2,"Native SaveSettings separates local items from the scoped cloud projection")
     for index,item in ipairs(ui.annotation.annotations) do
         if item.zotero_source and item.zotero_source.annotation_key=="ANNOT002" then ui.highlight.highlight_idx=index end
     end
@@ -273,7 +273,7 @@ local ok, err = xpcall(function()
     ui.document.configurable.text_wrap=0
     cache({},11)
     plugin:onReadSettings(config)
-    check(#ui.annotation.annotations==2 and config.data.zotero_annotations_applied.library_version==11,"Empty cloud list keeps native items")
+    check(#ui.annotation.annotations==2 and config:readSetting("zotero_annotations_applied").library_version==11,"Empty cloud list keeps native items")
     check(support.read(path)=="immutable PDF stand-in" and #support.requests==0,"Reader load neither writes PDF nor uses HTTP")
 end,debug.traceback)
 support.teardown()

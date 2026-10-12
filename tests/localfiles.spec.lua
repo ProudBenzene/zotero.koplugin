@@ -87,6 +87,84 @@ describe("Local PDF removal", function()
         assert(LocalFiles.removePDF(API,"ATTACH01",path))
     end)
 
+    it("blocks individual EPUB deletion when an open copy shares newly saved hash settings",function()
+        local item = API.getItems().ATTACH01
+        item.data.contentType = "application/epub+zip"
+        item.data.filename = "paper.epub"
+        path = directory.."/paper.epub"
+        support.write(path,"local EPUB")
+        local sidecar = support.directory.."/shared.sdr"
+        assert(support.makePath(sidecar))
+        local metadata = sidecar.."/metadata.epub.lua"
+        support.write(metadata,"open document reading data")
+        support.doc_settings[path] = {hash_sidecar_dir=sidecar,candidates={{path=metadata}}}
+        local other = support.directory.."/ordinary.epub"
+        support.doc_settings[other] = {hash_sidecar_dir=sidecar.."/./"}
+        local reader = require("apps/reader/readerui")
+        reader.instance = {document={file=other},doc_settings=require("docsettings"):open(other)}
+        local deleted,err = LocalFiles.removeAttachment(API,"ATTACH01",path)
+        assert(not deleted and err:find("share its reading data",1,true))
+        assert(support.read(path)=="local EPUB" and support.read(metadata)=="open document reading data")
+        assert(support.read(directory.."/.zotero-annotations.json")=="cached cloud annotations" and not support.purged_path)
+        reader.instance = nil
+        assert(LocalFiles.removeAttachment(API,"ATTACH01",path))
+        assert(not require("libs/libkoreader-lfs").attributes(metadata) and #support.requests==0)
+    end)
+
+    it("protects a shared page cache and allows deletion when the open reader uses different settings",function()
+        local cache = support.directory.."/page.cache"
+        support.write(cache,"open page cache")
+        support.doc_settings[path] = {data={cache_file_path=cache}}
+        local other = support.directory.."/ordinary.pdf"
+        support.doc_settings[other] = {data={cache_file_path=cache}}
+        local reader = require("apps/reader/readerui")
+        reader.instance = {document={file=other},doc_settings=require("docsettings"):open(other)}
+        assert(not LocalFiles.removePDF(API,"ATTACH01",path))
+        assert(support.read(cache)=="open page cache" and support.read(path)=="local PDF")
+        support.doc_settings[other] = {}
+        reader.instance.doc_settings = require("docsettings"):open(other)
+        assert(LocalFiles.removePDF(API,"ATTACH01",path))
+        assert(not require("libs/libkoreader-lfs").attributes(cache))
+    end)
+
+    it("keeps renamed download receipts until batch cleanup removes the last tracked copy",function()
+        local Cleanup = require("downloadcleanup")
+        local item = API.getItems().ATTACH01
+        -- Exercise the real legacy receipt upgrade and rename download flow.
+        assert(API.downloadAndGetPath(item.key)==path and #support.requests==0)
+        item.data.filename = "renamed.epub"
+        item.data.contentType = "application/epub+zip"
+        support.response = function(req) return support.respond(req,"renamed EPUB") end
+        local renamed = assert(API.downloadAndGetPath(item.key))
+        local requests = #support.requests
+        local receipt_path = directory.."/.zotero-cache.json"
+        local receipt = support.read(receipt_path)
+        assert(support.JSON.decode(receipt).previous_files[1].filename=="paper.pdf")
+        local unknown = directory.."/user-added.pdf"
+        support.write(unknown,"keep")
+        assert(LocalFiles.removeAttachment(API,item.key,renamed))
+        assert(support.read(path)=="local PDF" and support.read(receipt_path)==receipt)
+        assert(support.read(directory.."/.zotero-annotations.json")=="cached cloud annotations")
+        local scan = Cleanup.scanDownloads(API)
+        assert(#scan.targets==1 and scan.targets[1].path==path and #scan.unknown==1 and scan.unknown[1]==unknown)
+        local stats = Cleanup.newStats(scan)
+        Cleanup.processTarget(scan.targets[1],stats)
+        local lfs = require("libs/libkoreader-lfs")
+        assert(stats.deleted==1 and stats.failed==0 and stats.pending==0 and not lfs.attributes(path))
+        assert(not lfs.attributes(receipt_path) and not lfs.attributes(directory.."/.zotero-annotations.json"))
+        assert(support.read(unknown)=="keep" and #Cleanup.scanDownloads(API).targets==0 and #support.requests==requests)
+    end)
+
+    it("does not keep a receipt solely for missing tracked copies or untracked documents",function()
+        support.write(directory.."/.zotero-cache.json",support.JSON.encode({format=1,source="zotero.koplugin",
+            user_id="123",attachment_key="ATTACH01",filename="paper.pdf",content_type="application/pdf",
+            previous_files={{filename="missing.pdf",content_type="application/pdf"}}}))
+        support.write(directory.."/untracked.pdf","keep")
+        assert(LocalFiles.removePDF(API,"ATTACH01",path))
+        assert(not require("libs/libkoreader-lfs").attributes(directory.."/.zotero-cache.json"))
+        assert(support.read(directory.."/untracked.pdf")=="keep" and #require("downloadcleanup").scanDownloads(API).targets==0)
+    end)
+
     it("refuses a changed confirmation target or a redirected attachment directory",function()
         browser:confirmDeleteLocalPDF(browser.last_items[1])
         local confirmation = support.UI.shown[#support.UI.shown]

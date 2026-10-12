@@ -1,6 +1,7 @@
 -- Local removal only: this module never calls a Zotero or WebDAV endpoint.
 local ffiutil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
+local FileUtil = require("fileutil")
 local LocalFiles = {}
 local media = { ["application/pdf"] = true, ["application/epub+zip"] = true }
 
@@ -54,6 +55,66 @@ function LocalFiles.captureSettings(path)
     return LocalFiles.settingsTask(settings), settings
 end
 
+local function settings_path(path)
+    if type(path) ~= "string" or path == "" or path:find("%z") then return nil end
+    path = ffiutil.realpath(path) or path
+    if path:sub(1, 1) ~= "/" then path = (ffiutil.realpath(".") or ".") .. "/" .. path end
+    local parts = {}
+    for part in path:gmatch("[^/]+") do
+        if part == ".." then table.remove(parts)
+        elseif part ~= "." then parts[#parts + 1] = part end
+    end
+    return "/" .. table.concat(parts, "/")
+end
+
+function LocalFiles.sharesOpenSettings(task)
+    local reader = require("apps/reader/readerui").instance
+    if not reader or not reader.doc_settings then return false end
+    local active = LocalFiles.settingsTask(reader.doc_settings)
+    local protected = {}
+    local function protect(path)
+        path = settings_path(path)
+        if path then protected[path] = true end
+    end
+    for _, path in ipairs(active.files) do protect(path) end
+    protect(active.cache_file)
+    -- DocSettings:flush() can create metadata without refreshing candidates.
+    -- Shared directories still identify reading data used by the open reader.
+    for _, path in ipairs(active.dirs) do protect(path) end
+    for _, path in ipairs(task.files) do
+        if protected[settings_path(path)] then return true end
+    end
+    if protected[settings_path(task.cache_file)] then return true end
+    for _, path in ipairs(task.dirs or {}) do
+        if protected[settings_path(path)] then return true end
+    end
+    return false
+end
+
+local function has_other_downloads(api, key, directory, path)
+    local receipt_path = directory .. "/.zotero-cache.json"
+    if lfs.attributes(receipt_path, "mode") ~= "file"
+        or lfs.symlinkattributes and lfs.symlinkattributes(receipt_path, "mode") == "link"
+        or ffiutil.realpath(receipt_path) ~= receipt_path
+        or (lfs.attributes(receipt_path, "size") or 0) > 1024 * 1024 then return false end
+    local receipt = FileUtil.readJSON(receipt_path)
+    local user = tostring(api.getUserID() or ""):match("^%s*(.-)%s*$")
+    if not receipt or receipt.format ~= 1 or receipt.source ~= "zotero.koplugin"
+        or receipt.user_id ~= user or receipt.attachment_key ~= key or not media[receipt.content_type] then return false end
+    local function remains(record)
+        local name = type(record) == "table" and record.filename
+        if not FileUtil.validFilename(name) or not media[record.content_type] then return false end
+        local other = directory .. "/" .. name
+        return other ~= path and lfs.attributes(other, "mode") == "file" and ffiutil.realpath(other) == other
+            and not (lfs.symlinkattributes and lfs.symlinkattributes(other, "mode") == "link")
+    end
+    if remains(receipt) then return true end
+    for _, previous in ipairs(type(receipt.previous_files) == "table" and receipt.previous_files or {}) do
+        if remains(previous) then return true end
+    end
+    return false
+end
+
 -- Callers validate the document and (for persisted tasks) every cleanup path.
 -- Only unlink known files; directory removal always requires it to be empty.
 function LocalFiles.cleanup(path, directory, task, settings, keep_slot_cache)
@@ -97,11 +158,16 @@ function LocalFiles.removeAttachment(api, key, expected_path, pdf_only)
     -- Open settings while the file still exists, so hash-based sidecars are
     -- located correctly. Never purge annotations when removing the PDF fails.
     local task, settings = LocalFiles.captureSettings(path)
+    if LocalFiles.sharesOpenSettings(task) then
+        return nil, "Close the open document before deleting downloads that share its reading data."
+    end
+    -- A renamed old copy needs this receipt to remain identifiable by cleanup.
+    local keep_slot_cache = has_other_downloads(api, key, directory, path)
     local ok
     ok, err = os.remove(path)
     if not ok then return nil, err end
 
-    local _, message = LocalFiles.cleanup(path, directory, task, settings)
+    local _, message = LocalFiles.cleanup(path, directory, task, settings, keep_slot_cache)
     return true, message
 end
 

@@ -1,4 +1,5 @@
-local _ = require("gettext")
+local I18n = require("i18n")
+local _ = I18n.text
 
 return {
     name = "Zotero",

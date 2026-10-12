@@ -36,6 +36,32 @@ local function settings(data)
         saveSetting=function(self,key,value) self.data[key]=value end,
     }
 end
+local function fail_receipt(failure, attempt)
+    local open,rename=io.open,os.rename
+    local writes,renames=0,0
+    io.open=function(name,mode)
+        if name==directory.."/.zotero-cache.json.tmp" and mode=="wb" then
+            writes=writes+1
+            if writes==attempt then
+                if failure=="open" then return nil,"receipt failure" end
+                local file=assert(open(name,mode))
+                return {
+                    write=function(_,value) if failure=="write" then return nil,"receipt failure" end;return file:write(value) end,
+                    close=function() local ok=file:close();if failure=="close" then return nil,"receipt failure" end;return ok end,
+                }
+            end
+        end
+        return open(name,mode)
+    end
+    os.rename=function(from,to)
+        if to==directory.."/.zotero-cache.json" then
+            renames=renames+1
+            if renames==attempt and failure=="rename" then return nil,"receipt failure" end
+        end
+        return rename(from,to)
+    end
+    return function() io.open,os.rename=open,rename end
+end
 local function reader(local_items)
     local ui={callbacks={},annotation={annotations=local_items or {}},view={highlight={page_boxes={old=true}}}}
     ui.document={file=path,is_pdf=true,info={number_of_pages=3},configurable={text_wrap=0},
@@ -351,7 +377,7 @@ describe("One-way Zotero PDF annotations",function()
         cache({},11)
         assert(Annotations.applyToReader(API,ui,config,"ATTACH01"))
         assert(#ui.annotation.annotations==1 and ui.annotation.annotations[1]==foreign)
-        assert(config.data.zotero_annotations_applied.library_version==11)
+        assert(config:readSetting("zotero_annotations_applied").library_version==11)
     end)
 
     it("blocks cloud highlight extension while allowing independent local replacement",function()
@@ -410,25 +436,76 @@ describe("One-way Zotero PDF annotations",function()
         assert(#ui.annotation.annotations==1 and ui.annotation.annotations[1]==bookmark)
     end)
 
+    it("migrates a mixed legacy projection by scope without losing marked bookmarks or fallback rectangles",function()
+        local own=assert(Annotations.convert(snapshot({annotation()}),reader().document))[1]
+        local other_snapshot=snapshot({annotation("ANNOT002",10,{parent="ATTACH02"})})
+        other_snapshot.attachment_key="ATTACH02"
+        local other=assert(Annotations.convert(other_snapshot,reader().document))[1]
+        local bookmark={page=2,text="Local bookmark",zotero_source=other.zotero_source}
+        local legacy={bookmark,own,other}
+        local applied={user_id="123",attachment_key="ATTACH01",library_version=10,file_identity={md5=MD5}}
+        local config=settings({annotations=legacy,zotero_annotations_applied=applied,last_page=2})
+        local read,save=config.readSetting,config.saveSetting
+        support.write(directory.."/.zotero-annotations.json","broken")
+        local ui=reader(legacy)
+        local result,err=Annotations.applyToReader(API,ui,config,"ATTACH01")
+        assert(not result and err and #ui.annotation.annotations==2 and ui.annotation.annotations[1]==bookmark)
+        assert(ui.document:getPageBoxesFromPositions(own.page,own.pos0,own.pos1)==own.pboxes)
+        config:saveSetting("annotations",ui.annotation.annotations)
+        assert(#config.data.annotations==1 and config.data.annotations[1]==bookmark and config.data.last_page==2)
+        assert(config.data.zotero_annotations["123/ATTACH01"].applied==applied)
+        assert(config.data.zotero_annotations["123/ATTACH02"].annotations[1]==other)
+        assert(config.data.zotero_annotations_applied==nil)
+        Annotations.releaseReader(ui)
+        assert(config.readSetting==read and config.saveSetting==save and config._zotero_settings==nil)
+        assert(config:readSetting("annotations")[1]==bookmark)
+    end)
+
+    for _,field in ipairs({"annotations","zotero_annotations","zotero_annotations_applied"}) do
+        it("rolls back both scoped and local data when native "..field.." saving fails",function()
+            cache({annotation()})
+            local native={page=2,text="Local bookmark"}
+            local other={annotations={},applied={user_id="456",attachment_key="ATTACH01",library_version=8}}
+            local root={["456/ATTACH01"]=other}
+            local config=settings({annotations={native},zotero_annotations=root,last_page=2})
+            local original,fail=config.saveSetting,true
+            config.saveSetting=function(self,name,value)
+                original(self,name,value)
+                if fail and name==field then error("native settings failure") end
+            end
+            local ui=reader(config.data.annotations)
+            local displayed=ui.annotation.annotations
+            local result,err=Annotations.applyToReader(API,ui,config,"ATTACH01")
+            assert(not result and err:find("native settings failure",1,true))
+            assert(ui.annotation.annotations==displayed and config.data.annotations==displayed)
+            assert(config.data.zotero_annotations==root and root["456/ATTACH01"]==other)
+            assert(config.data.last_page==2 and config:readSetting("zotero_annotations_applied")==nil)
+            fail=false
+            assert(Annotations.applyToReader(API,ui,config,"ATTACH01"))
+            assert(#ui.annotation.annotations==2 and config.data.zotero_annotations["456/ATTACH01"]==other)
+            assert(config:readSetting("zotero_annotations_applied").library_version==10)
+        end)
+    end
+
     it("does not advance applied state or replace the displayed list after a geometry failure",function()
         cache({annotation()})
         local ui=reader();local config=settings()
         assert(Annotations.applyToReader(API,ui,config,"ATTACH01"))
-        local previous,receipt=ui.annotation.annotations,config.data.zotero_annotations_applied
+        local previous,receipt=ui.annotation.annotations,config:readSetting("zotero_annotations_applied")
         cache({annotation(nil,11)},11)
         ui.document.getNativePageDimensions=function() return nil end
         local result,err=Annotations.applyToReader(API,ui,config,"ATTACH01")
         assert(not result and err:find("dimensions",1,true) and ui.annotation.annotations==previous)
-        assert(config.data.zotero_annotations_applied==receipt)
+        assert(config:readSetting("zotero_annotations_applied")==receipt)
         ui.document.getNativePageDimensions=function() return {w=600,h=800} end
-        assert(Annotations.applyToReader(API,ui,config,"ATTACH01") and config.data.zotero_annotations_applied.library_version==11)
+        assert(Annotations.applyToReader(API,ui,config,"ATTACH01") and config:readSetting("zotero_annotations_applied").library_version==11)
     end)
 
     it("rejects changed files, out-of-range pages and invalid standard-page geometry",function()
         cache({annotation()},10,{md5=string.rep("1",32)})
         local ui=reader({{page=1}});local config=settings()
         local result,err=Annotations.applyToReader(API,ui,config,"ATTACH01")
-        assert(not result and err:find("different PDF",1,true) and config.data.zotero_annotations_applied==nil)
+        assert(not result and err:find("different PDF",1,true) and config:readSetting("zotero_annotations_applied")==nil)
         for _,position in ipairs({{pageIndex=3,rects={{10,100,100,120}}},{pageIndex=0,rects={{10,100,700,120}}}}) do
             cache({annotation(nil,nil,{position=position})})
             assert(not Annotations.applyToReader(API,ui,config,"ATTACH01") and #ui.annotation.annotations==1)
@@ -439,7 +516,8 @@ describe("One-way Zotero PDF annotations",function()
         cache({annotation()})
         local ui=reader();local config=settings()
         assert(Annotations.applyToReader(API,ui,config,"ATTACH01"))
-        local old,applied=ui.annotation.annotations,config.data.zotero_annotations_applied
+        local old,applied=ui.annotation.annotations,config:readSetting("zotero_annotations_applied")
+        local native,records=config.data.annotations,config.data.zotero_annotations
         cache({},11)
         local save=config.saveSetting
         config.saveSetting=function(self,name,value)
@@ -448,10 +526,10 @@ describe("One-way Zotero PDF annotations",function()
         end
         local result,err=Annotations.applyToReader(API,ui,config,"ATTACH01")
         assert(not result and err:find("settings failure",1,true))
-        assert(ui.annotation.annotations==old and config.data.annotations==old and config.data.zotero_annotations_applied==applied)
+        assert(ui.annotation.annotations==old and config.data.annotations==native and config.data.zotero_annotations==records and config:readSetting("zotero_annotations_applied")==applied)
         config.saveSetting=save
         assert(Annotations.applyToReader(API,ui,config,"ATTACH01") and #ui.annotation.annotations==0)
-        assert(config.data.zotero_annotations_applied.library_version==11)
+        assert(config:readSetting("zotero_annotations_applied").library_version==11)
     end)
 
     it("keeps the last applied rectangles usable when the independent cache is damaged",function()
@@ -461,7 +539,7 @@ describe("One-way Zotero PDF annotations",function()
         local reopened=reader(config.data.annotations)
         support.write(directory.."/.zotero-annotations.json","damaged")
         local result,err=Annotations.applyToReader(API,reopened,config,"ATTACH01")
-        assert(not result and err and config.data.zotero_annotations_applied.library_version==10)
+        assert(not result and err and config:readSetting("zotero_annotations_applied").library_version==10)
         local item=reopened.annotation.annotations[1]
         assert(reopened.document:getPageBoxesFromPositions(1,item.pos0,item.pos1)==item.pboxes)
         support.write(directory.."/.zotero-cache.json",support.JSON.encode({version=11,md5=string.rep("1",32)}))
@@ -480,6 +558,85 @@ describe("One-way Zotero PDF annotations",function()
         assert(Annotations.applyToReader(API,ui,settings(),"ATTACH01"))
         assert(ui.annotation.annotations[1].pboxes[1].y==480)
     end)
+
+    for _,failure in ipairs({"open","write","close","rename"}) do
+        it("preserves the old PDF and identity if pending receipt "..failure.." fails",function()
+            cache({annotation()})
+            local old_receipt=support.read(directory.."/.zotero-cache.json")
+            local old_cache=support.read(directory.."/.zotero-annotations.json")
+            attachment.data.md5=string.rep("1",32);attachment.version=11
+            support.seed({ATTACH01=attachment},{},11)
+            support.digests["updated PDF"]=attachment.data.md5
+            support.response=function(req) return support.respond(req,"updated PDF",nil,{etag='"'..attachment.data.md5..'"'}) end
+            local restore=fail_receipt(failure,1)
+            local result,err=API.downloadAndGetPath("ATTACH01")
+            restore()
+            assert(not result and err:find("receipt failure",1,true))
+            assert(support.read(path)=="hello" and support.read(directory.."/.zotero-cache.json")==old_receipt)
+            assert(support.read(directory.."/.zotero-annotations.json")==old_cache)
+            local ui,config=reader(),settings()
+            assert(Annotations.applyToReader(API,ui,config,"ATTACH01").imported==1)
+            assert(ui.document._zotero_adapter.file_matches==true)
+        end)
+
+        it("blocks stale projections after final receipt "..failure.." fails and recovers on retry",function()
+            cache({annotation()})
+            local ui,config=reader(),settings()
+            assert(Annotations.applyToReader(API,ui,config,"ATTACH01"))
+            local previous=config:readSetting("annotations")
+            local native,records=config.data.annotations,config.data.zotero_annotations
+            local old_cache=support.read(directory.."/.zotero-annotations.json")
+            attachment.data.md5=string.rep("1",32);attachment.version=11
+            support.seed({ATTACH01=attachment},{},11)
+            support.digests["updated PDF"]=attachment.data.md5
+            local updated=annotation(nil,11,{text="Updated text"})
+            support.response=function(req)
+                if req.url:find("/file",1,true) then return support.respond(req,"updated PDF",nil,{etag='"'..attachment.data.md5..'"'}) end
+                if req.url:find("/keys/current",1,true) then return support.key(req) end
+                if req.url:find("/children?",1,true) then return support.respond(req,{updated},11) end
+                return support.respond(req,attachment)
+            end
+            local restore=fail_receipt(failure,2)
+            local result,err=API.downloadAndGetPath("ATTACH01")
+            restore()
+            assert(not result and err:find("receipt failure",1,true) and support.read(path)=="updated PDF")
+            assert(support.read(directory.."/.zotero-annotations.json")==old_cache)
+            API.init(API.zotero_dir) -- Reload from disk, as a later offline reader does.
+            assert(API.getAttachmentStatus("ATTACH01")=="outdated")
+            ui=reader(previous)
+            result,err=Annotations.applyToReader(API,ui,config,"ATTACH01")
+            assert(not result and err and config.data.annotations==native and config.data.zotero_annotations==records)
+            assert(ui.document._zotero_adapter.file_matches==false)
+            assert(ui.document:getPageBoxesFromPositions(previous[1].page,previous[1].pos0,previous[1].pos1)==nil)
+            assert(API.downloadAndGetPath("ATTACH01")==path and API.getAttachmentStatus("ATTACH01")=="downloaded")
+            assert(Annotations.ensureCached(API,"ATTACH01"))
+            assert(Annotations.applyToReader(API,ui,config,"ATTACH01").imported==1)
+            assert(ui.document._zotero_adapter.file_matches and ui.annotation.annotations[1].text=="Updated text")
+        end)
+    end
+
+    for _,identity in ipairs({"md5","version"}) do
+        it("rejects a pending "..identity.." identity when file replacement fails",function()
+            attachment.data.md5=identity=="md5" and string.rep("1",32) or nil
+            attachment.version=11
+            support.seed({ATTACH01=attachment},{},11)
+            support.digests["updated PDF"]=attachment.data.md5
+            cache({annotation(nil,11)},11,identity=="md5" and {md5=attachment.data.md5} or {version=11})
+            support.response=function(req) return support.respond(req,"updated PDF") end
+            local rename=os.rename
+            os.rename=function(from,to) if to==path then return nil,"file publication failure" end;return rename(from,to) end
+            local result,err=API.downloadAndGetPath("ATTACH01")
+            os.rename=rename
+            assert(not result and err:find("file publication failure",1,true) and support.read(path)=="hello")
+            API.init(API.zotero_dir)
+            assert(API.getAttachmentStatus("ATTACH01")=="outdated")
+            local ui,config=reader(),settings()
+            result,err=Annotations.applyToReader(API,ui,config,"ATTACH01")
+            assert(not result and err and config.data.annotations==nil and #ui.annotation.annotations==0)
+            assert(API.downloadAndGetPath("ATTACH01")==path)
+            assert(Annotations.applyToReader(API,ui,config,"ATTACH01").imported==1)
+        end)
+    end
 
     it("does not advance the cache after a temporary file write fails",function()
         cache({annotation()});serve({},11)
@@ -805,9 +962,9 @@ describe("One-way Zotero PDF annotations",function()
         support.UI.scheduled[1]()
         assert(Annotations.readCache(API,"ATTACH01").library_version==11)
         assert(ui.annotation.annotations==displayed and displayed[1].text=="Selected text")
-        assert(config.data.zotero_annotations_applied.library_version==10)
+        assert(config:readSetting("zotero_annotations_applied").library_version==10)
         plugin:onReadSettings(config)
-        assert(ui.annotation.annotations[1].text=="Changed remotely" and config.data.zotero_annotations_applied.library_version==11)
+        assert(ui.annotation.annotations[1].text=="Changed remotely" and config:readSetting("zotero_annotations_applied").library_version==11)
     end)
 
     it("shows Chinese annotation progress and summary messages",function()
